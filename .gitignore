@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+coverage/
+
+# Local/generated artifacts
+output/
+*.log
+.DS_Store
+
+# Local environment files
+.env
+.env.*
+
+# Editor/IDE state
+.cursor/
+.vscode/
+
+# Internal agent workflow docs and handoff context
+.claude/
+AGENTS.md
+CLAUDE.md
+zip_context_ignore.md
+docs/tasks/
+
+# OS / temp
+tmp/
+.tmp/
