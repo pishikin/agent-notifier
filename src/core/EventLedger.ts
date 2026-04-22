@@ -3,8 +3,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import type {
-    AgentTurnEvent,
+    AgentAttentionEvent,
     AppConfig,
+    AttentionEventKind,
+    ClaudeNotificationType,
     EventLedgerMaintenanceState,
     EventMarker,
     EventProcessingState,
@@ -19,6 +21,7 @@ import {
 } from '../utils/paths.js';
 
 const RESERVATION_TTL_MS = 120_000;
+const APPROVAL_RENOTIFY_TTL_MS = 15_000;
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const BACKUP_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
 
@@ -50,7 +53,7 @@ export class EventLedger {
         };
     }
 
-    async reserve(event: AgentTurnEvent): Promise<ReservationResult> {
+    async reserve(event: AgentAttentionEvent): Promise<ReservationResult> {
         await this.ensureDirectories();
         return this.reserveInternal(event, false);
     }
@@ -161,7 +164,7 @@ export class EventLedger {
         );
     }
 
-    private async reserveInternal(event: AgentTurnEvent, allowRetryAfterCorruption: boolean): Promise<ReservationResult> {
+    private async reserveInternal(event: AgentAttentionEvent, allowRetryAfterCorruption: boolean): Promise<ReservationResult> {
         const markerPath = this.getMarkerPath(event.eventId);
         const reservedAt = new Date().toISOString();
         const marker = buildReservedMarker(event, reservedAt);
@@ -191,6 +194,22 @@ export class EventLedger {
         }
 
         if (existing.processingState !== 'reserved') {
+            if (event.kind === 'approval-request' && existing.kind === 'approval-request' && shouldRenotifyApproval(existing)) {
+                const renamed = await this.tryRenameMarker(markerPath, 'repeated');
+                if (!renamed) {
+                    const latest = await this.readMarkerFile(markerPath);
+                    if (latest && latest.processingState === 'reserved') {
+                        return { kind: 'inflight', existing: latest };
+                    }
+                    if (latest && !shouldRenotifyApproval(latest)) {
+                        return { kind: 'duplicate', existing: latest };
+                    }
+                    return this.reserveInternal(event, false);
+                }
+
+                return this.reserveInternal(event, false);
+            }
+
             return { kind: 'duplicate', existing };
         }
 
@@ -199,7 +218,7 @@ export class EventLedger {
             return { kind: 'inflight', existing };
         }
 
-        const renamed = await this.tryRenameStaleMarker(markerPath);
+        const renamed = await this.tryRenameMarker(markerPath, 'stale');
         if (!renamed) {
             const latest = await this.readMarkerFile(markerPath);
             if (latest && latest.processingState === 'reserved') {
@@ -214,8 +233,8 @@ export class EventLedger {
         return this.reserveInternal(event, false);
     }
 
-    private async tryRenameStaleMarker(markerPath: string): Promise<boolean> {
-        const stalePath = this.buildBackupPath(markerPath, 'stale');
+    private async tryRenameMarker(markerPath: string, suffix: 'corrupt' | 'stale' | 'repeated'): Promise<boolean> {
+        const stalePath = this.buildBackupPath(markerPath, suffix);
         try {
             await fs.rename(markerPath, stalePath);
             return true;
@@ -229,7 +248,7 @@ export class EventLedger {
         await fs.rename(markerPath, backupPath);
     }
 
-    private buildBackupPath(markerPath: string, suffix: 'corrupt' | 'stale'): string {
+    private buildBackupPath(markerPath: string, suffix: 'corrupt' | 'stale' | 'repeated'): string {
         const base = markerPath.replace(/\.json$/, '');
         return `${base}.${suffix}.${Date.now()}.${process.pid}.json`;
     }
@@ -279,7 +298,7 @@ export class EventLedger {
     private async readBackupEntries(): Promise<Array<{ path: string; mtimeMs: number }>> {
         try {
             const names = await fs.readdir(this.paths.markersDir);
-            const backupNames = names.filter(name => /\.(stale|corrupt)\.\d+\.\d+\.json$/.test(name));
+            const backupNames = names.filter(name => /\.(stale|corrupt|repeated)\.\d+\.\d+\.json$/.test(name));
             return Promise.all(backupNames.map(async name => {
                 const backupPath = path.join(this.paths.markersDir, name);
                 const stat = await fs.stat(backupPath);
@@ -315,18 +334,18 @@ export function buildEventIdHash(eventId: string): string {
     return createHash('sha256').update(eventId).digest('hex').slice(0, 40);
 }
 
-function buildReservedMarker(event: AgentTurnEvent, reservedAt: string): EventMarker {
+function buildReservedMarker(event: AgentAttentionEvent, reservedAt: string): EventMarker {
     return {
-        schemaVersion: 2,
+        schemaVersion: 3,
         eventId: event.eventId,
         eventIdHash: buildEventIdHash(event.eventId),
         source: event.source,
         agentType: event.agentType,
-        outcome: event.outcome,
+        kind: event.kind,
         workspacePath: event.workspacePath,
         projectName: event.projectName,
         windowId: event.windowId,
-        completedAt: event.completedAt,
+        occurredAt: event.occurredAt,
         processingState: 'reserved',
         reservedAt,
         updatedAt: reservedAt,
@@ -345,32 +364,31 @@ function parseEventMarker(raw: string): EventMarker | null {
         if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
             return null;
         }
+
         const record = parsed as Record<string, unknown>;
-        const schemaVersion = record.schemaVersion;
         const eventId = readString(record.eventId);
         const eventIdHash = readString(record.eventIdHash);
         const source = readHookSource(record.source);
         const agentType = readAgentType(record.agentType);
-        const outcome = readOutcome(record.outcome);
+        const kind = readMarkerKind(record);
         const workspacePath = readString(record.workspacePath);
         const projectName = readString(record.projectName);
         const windowId = readString(record.windowId);
-        const completedAt = readString(record.completedAt);
+        const occurredAt = readString(record.occurredAt) ?? readString(record.completedAt);
         const processingState = readProcessingState(record.processingState);
         const reservedAt = readString(record.reservedAt);
         const updatedAt = readString(record.updatedAt);
 
         if (
-            schemaVersion !== 2
-            || !eventId
+            !eventId
             || !eventIdHash
             || !source
             || !agentType
-            || !outcome
+            || !kind
             || !workspacePath
             || !projectName
             || !windowId
-            || !completedAt
+            || !occurredAt
             || !processingState
             || !reservedAt
             || !updatedAt
@@ -379,16 +397,16 @@ function parseEventMarker(raw: string): EventMarker | null {
         }
 
         const marker: EventMarker = {
-            schemaVersion: 2,
+            schemaVersion: 3,
             eventId,
             eventIdHash,
             source,
             agentType,
-            outcome,
+            kind,
             workspacePath,
             projectName,
             windowId,
-            completedAt,
+            occurredAt,
             processingState,
             reservedAt,
             updatedAt,
@@ -450,19 +468,32 @@ function readProviderEvent(value: unknown): EventMarker['providerEvent'] | undef
     const codexThreadId = readString(record.codexThreadId);
     const transcriptPath = readString(record.transcriptPath);
     const failureType = readString(record.failureType);
+    const toolName = readString(record.toolName);
+    const toolCommand = readString(record.toolCommand);
+    const toolDescription = readString(record.toolDescription);
+    const notificationType = readNotificationType(record.notificationType);
+    const notificationTitle = readString(record.notificationTitle);
+    const notificationMessage = readString(record.notificationMessage);
     const nextValue = {
         ...(hookEventName ? { hookEventName } : {}),
         ...(codexTurnId ? { codexTurnId } : {}),
         ...(codexThreadId ? { codexThreadId } : {}),
-        ...(typeof record.claudeStopHookActive === 'boolean'
-            ? { claudeStopHookActive: record.claudeStopHookActive }
+        ...(typeof record.stopHookActive === 'boolean'
+            ? { stopHookActive: record.stopHookActive }
             : {}),
         ...(transcriptPath ? { transcriptPath } : {}),
         ...(transcriptStat && typeof transcriptStat.size === 'number' && typeof transcriptStat.mtimeMs === 'number'
             ? { transcriptStat: transcriptStat as { size: number; mtimeMs: number } }
             : {}),
         ...(failureType ? { failureType } : {}),
+        ...(toolName ? { toolName } : {}),
+        ...(toolCommand ? { toolCommand } : {}),
+        ...(toolDescription ? { toolDescription } : {}),
+        ...(notificationType ? { notificationType } : {}),
+        ...(notificationTitle ? { notificationTitle } : {}),
+        ...(notificationMessage ? { notificationMessage } : {}),
     };
+
     return Object.keys(nextValue).length > 0 ? nextValue : undefined;
 }
 
@@ -524,6 +555,19 @@ function mapNotificationOutcome(result: NotificationSendResult): EventProcessing
     }
 }
 
+function shouldRenotifyApproval(marker: EventMarker): boolean {
+    if (marker.kind !== 'approval-request' || marker.processingState === 'reserved') {
+        return false;
+    }
+
+    const referenceTime = Date.parse(marker.finalizedAt ?? marker.updatedAt);
+    if (Number.isNaN(referenceTime)) {
+        return true;
+    }
+
+    return (Date.now() - referenceTime) >= APPROVAL_RENOTIFY_TTL_MS;
+}
+
 function isFileExistsError(error: unknown): boolean {
     return typeof error === 'object'
         && error !== null
@@ -538,8 +582,11 @@ function readString(value: unknown): string | undefined {
 function readHookSource(value: unknown): EventMarker['source'] | null {
     if (
         value === 'codex-notify'
+        || value === 'codex-stop'
+        || value === 'codex-permission-request'
         || value === 'claude-stop'
         || value === 'claude-stop-failure'
+        || value === 'claude-notification'
         || value === 'legacy-process-exit'
     ) {
         return value;
@@ -551,8 +598,24 @@ function readAgentType(value: unknown): EventMarker['agentType'] | null {
     return value === 'claude' || value === 'codex' ? value : null;
 }
 
-function readOutcome(value: unknown): EventMarker['outcome'] | null {
-    return value === 'completed' || value === 'failed' ? value : null;
+function readMarkerKind(record: Record<string, unknown>): AttentionEventKind | null {
+    const kind = record.kind;
+    if (kind === 'turn-complete' || kind === 'turn-failed' || kind === 'approval-request') {
+        return kind;
+    }
+
+    const schemaVersion = record.schemaVersion;
+    const outcome = record.outcome;
+    if (schemaVersion === 2) {
+        if (outcome === 'completed') {
+            return 'turn-complete';
+        }
+        if (outcome === 'failed') {
+            return 'turn-failed';
+        }
+    }
+
+    return null;
 }
 
 function readProcessingState(value: unknown): EventMarker['processingState'] | null {
@@ -567,6 +630,26 @@ function readProcessingState(value: unknown): EventMarker['processingState'] | n
     return null;
 }
 
-function readHookEventName(value: unknown): 'Stop' | 'StopFailure' | undefined {
-    return value === 'Stop' || value === 'StopFailure' ? value : undefined;
+function readHookEventName(value: unknown): 'Stop' | 'StopFailure' | 'PermissionRequest' | 'Notification' | undefined {
+    if (
+        value === 'Stop'
+        || value === 'StopFailure'
+        || value === 'PermissionRequest'
+        || value === 'Notification'
+    ) {
+        return value;
+    }
+    return undefined;
+}
+
+function readNotificationType(value: unknown): ClaudeNotificationType | undefined {
+    if (
+        value === 'permission_prompt'
+        || value === 'idle_prompt'
+        || value === 'auth_success'
+        || value === 'elicitation_dialog'
+    ) {
+        return value;
+    }
+    return undefined;
 }

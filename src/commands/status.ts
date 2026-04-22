@@ -6,7 +6,7 @@ import { LaunchAgent } from '../infra/LaunchAgent.js';
 import { EventLedger } from '../core/EventLedger.js';
 import { formatTimeAgo } from '../utils/process.js';
 import { getActivePath, getHistoryPath } from '../utils/paths.js';
-import type { AgentSession, ILogger, TurnCompletionEvent } from '../types.js';
+import type { AgentSession, EventMarker, ILogger, TurnCompletionEvent } from '../types.js';
 
 function readJsonFile<T>(filePath: string): T | null {
     try {
@@ -37,10 +37,19 @@ export async function statusCommand(): Promise<void> {
         ledger.listRecent(10),
     ]);
 
-    console.log('Mode: hook-first');
-    console.log(`Codex hook: ${hookStatus.codexConfigured ? '● configured' : '○ not configured'}`);
-    console.log(`Claude hook: ${hookStatus.claudeConfigured ? '● configured' : '○ not configured'}`);
+    console.log(`Mode: ${deriveRuntimeMode(hookStatus, isLegacyDaemonRunning)}`);
+    console.log(`Codex completion hook: ${hookStatus.codexCompletionConfigured ? '● configured' : '○ not configured'}`);
+    console.log(`Codex approval hook: ${hookStatus.codexApprovalConfigured ? '● configured' : '○ not configured'}`);
+    console.log(`Claude completion hook: ${hookStatus.claudeCompletionConfigured ? '● configured' : '○ not configured'}`);
+    console.log(`Claude approval hook: ${hookStatus.claudeApprovalConfigured ? '● configured' : '○ not configured'}`);
     console.log(`Legacy daemon: ${isLegacyDaemonRunning ? '● running (legacy)' : '○ stopped (legacy)'}`);
+
+    if (hookStatus.codexRuntimeMode) {
+        console.log(`Codex runtime mode: ${hookStatus.codexRuntimeMode}`);
+    }
+    if (hookStatus.externalCodexNotifyConfigured) {
+        console.log('Codex external notify: ● present');
+    }
 
     const active = readJsonFile<AgentSession[]>(getActivePath()) ?? [];
     if (isLegacyDaemonRunning && active.length > 0) {
@@ -53,14 +62,9 @@ export async function statusCommand(): Promise<void> {
     }
 
     if (recentMarkers.length > 0) {
-        console.log(`\nRecent completed turns (${recentMarkers.length}):`);
+        console.log(`\nRecent attention events (${recentMarkers.length}):`);
         for (const marker of recentMarkers) {
-            const when = formatTimeAgo(marker.finalizedAt ?? marker.completedAt);
-            const branchOrFailure = marker.outcome === 'failed'
-                ? marker.providerEvent?.failureType
-                : marker.gitBranch;
-            const suffix = branchOrFailure ? ` · ${branchOrFailure}` : '';
-            console.log(`  ${marker.agentType} ${marker.projectName}${suffix} — ${when}`);
+            console.log(`  ${formatMarker(marker)}`);
         }
     } else {
         const legacyHistory = readCompletionHistory().slice(0, 10);
@@ -71,22 +75,66 @@ export async function statusCommand(): Promise<void> {
                 const branchLabel = event.gitBranch ? ` · ${event.gitBranch}` : '';
                 console.log(`  ${event.agentType} ${event.projectName}${branchLabel} — ${ago}`);
             }
-        } else if (hookStatus.codexConfigured || hookStatus.claudeConfigured || isLegacyDaemonRunning) {
-            console.log('\nNo completed turns yet');
+        } else if (hasConfiguredHooks(hookStatus) || isLegacyDaemonRunning) {
+            console.log('\nNo attention events yet');
         }
     }
 
-    if (!hookStatus.codexConfigured || !hookStatus.claudeConfigured) {
+    if (!hasConfiguredHooks(hookStatus)) {
         console.log('\nRun `agent-notifier install` to configure the missing hooks.');
     }
 
     if (
         hookStatus.otherClaudeStopHooks > 0
-        || hookStatus.codexManagedMode === 'chain-existing'
+        || hookStatus.otherClaudePermissionPromptHooks > 0
+        || hookStatus.externalCodexNotifyConfigured
         || hookStatus.staleWrapperVersionDetected
         || isLegacyDaemonRunning
     ) {
         console.log('\nRun `agent-notifier doctor` for deeper health diagnostics.');
+    }
+}
+
+function hasConfiguredHooks(hookStatus: Awaited<ReturnType<HookInstaller['getStatus']>>): boolean {
+    return hookStatus.codexCompletionConfigured
+        && hookStatus.codexApprovalConfigured
+        && hookStatus.claudeCompletionConfigured
+        && hookStatus.claudeApprovalConfigured;
+}
+
+function deriveRuntimeMode(
+    hookStatus: Awaited<ReturnType<HookInstaller['getStatus']>>,
+    isLegacyDaemonRunning: boolean,
+): 'hooks-first' | 'hybrid' | 'notify-fallback' | 'degraded' {
+    if (hookStatus.codexRuntimeMode === 'hybrid') {
+        return 'hybrid';
+    }
+    if (hookStatus.codexRuntimeMode === 'notify-fallback') {
+        return 'notify-fallback';
+    }
+    if (hookStatus.codexRuntimeMode === 'hooks-first' && hasConfiguredHooks(hookStatus) && !isLegacyDaemonRunning) {
+        return 'hooks-first';
+    }
+    return 'degraded';
+}
+
+function formatMarker(marker: EventMarker): string {
+    const when = formatTimeAgo(marker.finalizedAt ?? marker.occurredAt);
+    switch (marker.kind) {
+        case 'turn-complete': {
+            const suffix = marker.gitBranch ? ` · ${marker.gitBranch}` : '';
+            return `${marker.agentType} ${marker.projectName}${suffix} — ${when}`;
+        }
+        case 'turn-failed': {
+            const suffix = marker.providerEvent?.failureType ? ` · ${marker.providerEvent.failureType}` : '';
+            return `${marker.agentType} ${marker.projectName}${suffix} — ${when}`;
+        }
+        case 'approval-request': {
+            const approvalLabel = marker.providerEvent?.toolName
+                ? `${marker.providerEvent.toolName} approval`
+                : 'approval needed';
+            return `${marker.agentType} ${marker.projectName} · ${approvalLabel} — ${when}`;
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { NotificationService } from '../../src/core/NotificationService.js';
 import { sanitizeShellArg } from '../../src/utils/process.js';
-import type { AgentTurnEvent, ICommandExecutor, ILogger } from '../../src/types.js';
+import type { AgentAttentionEvent, ICommandExecutor, ILogger } from '../../src/types.js';
 
 function makeLogger(): ILogger {
     return { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), close: vi.fn() };
@@ -14,16 +14,15 @@ function makeExecutor(exitCode = 0): ICommandExecutor {
     };
 }
 
-function makeEvent(overrides: Partial<AgentTurnEvent> = {}): AgentTurnEvent {
+function makeEvent(overrides: Partial<AgentAttentionEvent> = {}): AgentAttentionEvent {
     return {
         eventId: 'evt-123',
         source: 'claude-stop',
-        outcome: 'completed',
+        kind: 'turn-complete',
         agentType: 'claude',
         workspacePath: '/Users/user/my-project',
         projectName: 'my-project',
-        completedAt: '2026-04-17T00:00:00.000Z',
-        state: 'completed',
+        occurredAt: '2026-04-17T00:00:00.000Z',
         windowId: 'abc123def456',
         ...overrides,
     };
@@ -73,14 +72,32 @@ describe('NotificationService.send', () => {
         const service = new NotificationService(executor, makeLogger(), '/path/to/focus.sh', 'Glass');
 
         const result = await service.send(makeEvent({
-            agentType: 'claude',
             source: 'claude-stop-failure',
-            outcome: 'failed',
+            kind: 'turn-failed',
             providerEvent: { hookEventName: 'StopFailure', failureType: 'tool_error' },
         }));
 
         expect(result.title).toBe('claude stopped with error');
         expect(result.message).toBe('my-project · tool_error');
+    });
+
+    it('formats approval notifications from tool details', async () => {
+        const executor = makeExecutor(0);
+        const service = new NotificationService(executor, makeLogger(), '/path/to/focus.sh', 'Glass');
+
+        const result = await service.send(makeEvent({
+            agentType: 'codex',
+            source: 'codex-permission-request',
+            kind: 'approval-request',
+            providerEvent: {
+                hookEventName: 'PermissionRequest',
+                toolName: 'Bash',
+                toolDescription: 'Run npm install',
+            },
+        }));
+
+        expect(result.title).toBe('codex needs approval');
+        expect(result.message).toBe('my-project · Bash: Run npm install');
     });
 
     it('uses osascript fallback when terminal-notifier fails', async () => {

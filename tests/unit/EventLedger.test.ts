@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventLedger, buildEventIdHash } from '../../src/core/EventLedger.js';
-import type { AgentTurnEvent, AppConfig, ILogger, NotificationSendResult } from '../../src/types.js';
+import type { AgentAttentionEvent, AppConfig, ILogger, NotificationSendResult } from '../../src/types.js';
 
 function makeLogger(): ILogger {
     return { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), close: vi.fn() };
@@ -19,16 +19,15 @@ const defaultConfig: AppConfig = {
     logMaxSizeMb: 5,
 };
 
-function makeEvent(id: string, overrides: Partial<AgentTurnEvent> = {}): AgentTurnEvent {
+function makeEvent(id: string, overrides: Partial<AgentAttentionEvent> = {}): AgentAttentionEvent {
     return {
         eventId: id,
         source: 'claude-stop',
-        outcome: 'completed',
+        kind: 'turn-complete',
         agentType: 'claude',
         workspacePath: '/Users/user/project',
         projectName: 'project',
-        completedAt: '2026-04-17T00:00:00.000Z',
-        state: 'completed',
+        occurredAt: '2026-04-17T00:00:00.000Z',
         windowId: 'abc123',
         ...overrides,
     };
@@ -85,6 +84,7 @@ describe('EventLedger', () => {
         const marker = await ledger.getMarker(event.eventId);
         expect(marker).toMatchObject({
             eventId: 'evt-1',
+            kind: 'turn-complete',
             processingState: 'backend-accepted',
         });
     });
@@ -117,16 +117,16 @@ describe('EventLedger', () => {
 
         await fs.mkdir(markersDir, { recursive: true });
         await fs.writeFile(markerPath, JSON.stringify({
-            schemaVersion: 2,
+            schemaVersion: 3,
             eventId: event.eventId,
             eventIdHash: buildEventIdHash(event.eventId),
             source: event.source,
             agentType: event.agentType,
-            outcome: event.outcome,
+            kind: event.kind,
             workspacePath: event.workspacePath,
             projectName: event.projectName,
             windowId: event.windowId,
-            completedAt: event.completedAt,
+            occurredAt: event.occurredAt,
             processingState: 'reserved',
             reservedAt: '2020-01-01T00:00:00.000Z',
             updatedAt: '2020-01-01T00:00:00.000Z',
@@ -154,16 +154,52 @@ describe('EventLedger', () => {
     it('lists recent finalized events sorted by finalizedAt', async () => {
         const ledger = createLedger();
         const first = makeEvent('evt-1');
-        const second = makeEvent('evt-2');
+        const second = makeEvent('evt-2', { kind: 'approval-request', source: 'claude-notification' });
 
         await ledger.reserve(first);
         await ledger.finalize(first.eventId, makeResult());
         await new Promise(resolve => setTimeout(resolve, 5));
         await ledger.reserve(second);
-        await ledger.finalize(second.eventId, makeResult());
+        await ledger.finalize(second.eventId, makeResult({
+            title: 'claude needs approval',
+            message: 'project',
+        }));
 
         const recent = await ledger.listRecent(2);
         expect(recent.map(marker => marker.eventId)).toEqual(['evt-2', 'evt-1']);
+    });
+
+    it('allows approval events to notify again after the re-notify window', async () => {
+        const ledger = createLedger();
+        const event = makeEvent('evt-approval', {
+            kind: 'approval-request',
+            source: 'claude-notification',
+        });
+        const markerPath = path.join(markersDir, `${buildEventIdHash(event.eventId)}.json`);
+
+        await fs.mkdir(markersDir, { recursive: true });
+        await fs.writeFile(markerPath, JSON.stringify({
+            schemaVersion: 3,
+            eventId: event.eventId,
+            eventIdHash: buildEventIdHash(event.eventId),
+            source: event.source,
+            agentType: event.agentType,
+            kind: event.kind,
+            workspacePath: event.workspacePath,
+            projectName: event.projectName,
+            windowId: event.windowId,
+            occurredAt: event.occurredAt,
+            processingState: 'backend-accepted',
+            reservedAt: '2020-01-01T00:00:00.000Z',
+            updatedAt: '2020-01-01T00:00:01.000Z',
+            finalizedAt: '2020-01-01T00:00:01.000Z',
+        }), 'utf8');
+
+        const reservation = await ledger.reserve(event);
+        expect(['owned', 'corrupt-retried']).toContain(reservation.kind);
+
+        const files = await fs.readdir(markersDir);
+        expect(files.some(name => name.includes('.repeated.'))).toBe(true);
     });
 
     it('retains only the newest finalized markers during cleanup', async () => {

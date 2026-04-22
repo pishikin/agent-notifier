@@ -82,12 +82,24 @@ export function getCodexHookWrapperPath(): string {
     return path.join(getHooksDir(), 'codex-notify.sh');
 }
 
+export function getCodexStopHookWrapperPath(): string {
+    return path.join(getHooksDir(), 'codex-stop.sh');
+}
+
+export function getCodexPermissionHookWrapperPath(): string {
+    return path.join(getHooksDir(), 'codex-permission-request.sh');
+}
+
 export function getCodexLegacyNotifyPath(): string {
     return path.join(getHooksDir(), 'codex-legacy-notify.sh');
 }
 
 export function getClaudeHookWrapperPath(): string {
     return path.join(getHooksDir(), 'claude-stop.sh');
+}
+
+export function getClaudeNotificationHookWrapperPath(): string {
+    return path.join(getHooksDir(), 'claude-notification.sh');
 }
 
 export function getHookInstallStatePath(): string {
@@ -100,6 +112,10 @@ export function getInstallManifestPath(): string {
 
 export function getCodexConfigPath(): string {
     return path.join(os.homedir(), '.codex', 'config.toml');
+}
+
+export function getCodexHooksPath(): string {
+    return path.join(os.homedir(), '.codex', 'hooks.json');
 }
 
 export function getClaudeSettingsPath(): string {

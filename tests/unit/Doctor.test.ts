@@ -2,13 +2,18 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { HookStatus, InstallManifest } from '../../src/types.js';
+import type { EventMarker, HookStatus, InstallManifest } from '../../src/types.js';
 
 let tmpHome = '';
 let manifest: InstallManifest | null = null;
 let hookStatus: HookStatus;
 let legacyDaemonRunning = false;
-let ledgerStats = {
+let ledgerStats: {
+    finalizedCount: number;
+    reservedCount: number;
+    backupCount: number;
+    lastFinalized: EventMarker | null;
+} = {
     finalizedCount: 0,
     reservedCount: 0,
     backupCount: 0,
@@ -16,18 +21,26 @@ let ledgerStats = {
 };
 let execMock: (command: string, args: string[]) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
 
-vi.mock('../../src/utils/paths.js', () => ({
-    getConfigDir: () => path.join(tmpHome, '.agent-notifier'),
-    getHooksDir: () => path.join(tmpHome, '.agent-notifier', 'hooks'),
-    getBinDir: () => path.join(tmpHome, '.agent-notifier', 'bin'),
-    getShimPath: () => path.join(tmpHome, '.agent-notifier', 'bin', 'agent-notifier-shim'),
-    getCodexHookWrapperPath: () => path.join(tmpHome, '.agent-notifier', 'hooks', 'codex-notify.sh'),
-    getClaudeHookWrapperPath: () => path.join(tmpHome, '.agent-notifier', 'hooks', 'claude-stop.sh'),
-    getInstallManifestPath: () => path.join(tmpHome, '.agent-notifier', 'install-manifest.json'),
-    getHooksLogPath: () => path.join(tmpHome, '.agent-notifier', 'logs', 'hooks.log'),
-    getEventMarkersDir: () => path.join(tmpHome, '.agent-notifier', 'events', 'markers'),
-    getFocusScriptPath: () => path.join(tmpHome, 'focus-window.sh'),
-}));
+vi.mock('../../src/utils/paths.js', async importOriginal => {
+    const actual = await importOriginal<typeof import('../../src/utils/paths.js')>();
+    return {
+        ...actual,
+        getConfigDir: () => path.join(tmpHome, '.agent-notifier'),
+        getHooksDir: () => path.join(tmpHome, '.agent-notifier', 'hooks'),
+        getBinDir: () => path.join(tmpHome, '.agent-notifier', 'bin'),
+        getShimPath: () => path.join(tmpHome, '.agent-notifier', 'bin', 'agent-notifier-shim'),
+        getCodexHookWrapperPath: () => path.join(tmpHome, '.agent-notifier', 'hooks', 'codex-notify.sh'),
+        getCodexStopHookWrapperPath: () => path.join(tmpHome, '.agent-notifier', 'hooks', 'codex-stop.sh'),
+        getCodexPermissionHookWrapperPath: () => path.join(tmpHome, '.agent-notifier', 'hooks', 'codex-permission-request.sh'),
+        getClaudeHookWrapperPath: () => path.join(tmpHome, '.agent-notifier', 'hooks', 'claude-stop.sh'),
+        getClaudeNotificationHookWrapperPath: () => path.join(tmpHome, '.agent-notifier', 'hooks', 'claude-notification.sh'),
+        getInstallManifestPath: () => path.join(tmpHome, '.agent-notifier', 'install-manifest.json'),
+        getHooksLogPath: () => path.join(tmpHome, '.agent-notifier', 'logs', 'hooks.log'),
+        getEventMarkersDir: () => path.join(tmpHome, '.agent-notifier', 'events', 'markers'),
+        getFocusScriptPath: () => path.join(tmpHome, 'focus-window.sh'),
+        getCodexHooksPath: () => path.join(tmpHome, '.codex', 'hooks.json'),
+    };
+});
 
 vi.mock('../../src/infra/Config.js', () => ({
     loadConfig: () => ({
@@ -84,17 +97,26 @@ describe('buildDoctorReport', () => {
         await fs.mkdir(path.join(tmpHome, '.agent-notifier', 'bin'), { recursive: true });
         await fs.mkdir(path.join(tmpHome, '.agent-notifier', 'logs'), { recursive: true });
         await fs.mkdir(path.join(tmpHome, '.agent-notifier', 'events', 'markers'), { recursive: true });
-        await fs.writeFile(path.join(tmpHome, '.agent-notifier', 'hooks', 'codex-notify.sh'), '#!/bin/bash\n# agent-notifier-managed wrapper-version=2 provider=codex\n', 'utf8');
-        await fs.writeFile(path.join(tmpHome, '.agent-notifier', 'hooks', 'claude-stop.sh'), '#!/bin/bash\n# agent-notifier-managed wrapper-version=2 provider=claude\n', 'utf8');
+        await fs.mkdir(path.join(tmpHome, '.codex'), { recursive: true });
+
+        await fs.writeFile(path.join(tmpHome, '.agent-notifier', 'hooks', 'codex-stop.sh'), '#!/bin/bash\n# agent-notifier-managed wrapper-version=3 provider=codex-stop\n', 'utf8');
+        await fs.writeFile(path.join(tmpHome, '.agent-notifier', 'hooks', 'codex-permission-request.sh'), '#!/bin/bash\n# agent-notifier-managed wrapper-version=3 provider=codex-permission-request\n', 'utf8');
+        await fs.writeFile(path.join(tmpHome, '.agent-notifier', 'hooks', 'claude-stop.sh'), '#!/bin/bash\n# agent-notifier-managed wrapper-version=3 provider=claude-stop\n', 'utf8');
+        await fs.writeFile(path.join(tmpHome, '.agent-notifier', 'hooks', 'claude-notification.sh'), '#!/bin/bash\n# agent-notifier-managed wrapper-version=3 provider=claude-notification\n', 'utf8');
         await fs.writeFile(path.join(tmpHome, '.agent-notifier', 'bin', 'agent-notifier-shim'), '#!/usr/bin/env node\n', 'utf8');
         await fs.writeFile(path.join(tmpHome, '.agent-notifier', 'install-manifest.json'), '{}', 'utf8');
         await fs.writeFile(path.join(tmpHome, 'focus-window.sh'), '#!/bin/bash\n', 'utf8');
         await fs.writeFile(path.join(tmpHome, 'agent-notifier-runtime'), '#!/bin/bash\nexit 0\n', 'utf8');
-        await fs.chmod(path.join(tmpHome, '.agent-notifier', 'hooks', 'codex-notify.sh'), 0o755);
+        await fs.writeFile(path.join(tmpHome, '.codex', 'hooks.json'), '{}', 'utf8');
+
+        await fs.chmod(path.join(tmpHome, '.agent-notifier', 'hooks', 'codex-stop.sh'), 0o755);
+        await fs.chmod(path.join(tmpHome, '.agent-notifier', 'hooks', 'codex-permission-request.sh'), 0o755);
         await fs.chmod(path.join(tmpHome, '.agent-notifier', 'hooks', 'claude-stop.sh'), 0o755);
+        await fs.chmod(path.join(tmpHome, '.agent-notifier', 'hooks', 'claude-notification.sh'), 0o755);
         await fs.chmod(path.join(tmpHome, '.agent-notifier', 'bin', 'agent-notifier-shim'), 0o755);
         await fs.chmod(path.join(tmpHome, 'focus-window.sh'), 0o755);
         await fs.chmod(path.join(tmpHome, 'agent-notifier-runtime'), 0o755);
+
         await fs.writeFile(
             path.join(tmpHome, '.agent-notifier', 'logs', 'hooks.log'),
             [
@@ -105,19 +127,30 @@ describe('buildDoctorReport', () => {
         );
 
         manifest = {
-            schemaVersion: 2,
+            schemaVersion: 3,
             installedAt: '2026-04-17T00:00:00.000Z',
-            codexManagedMode: 'exclusive-managed',
+            codexRuntimeMode: 'hooks-first',
+            codexHooksFeatureStateBeforeInstall: 'missing',
             shimPath: path.join(tmpHome, '.agent-notifier', 'bin', 'agent-notifier-shim'),
             runtime: { kind: 'binary', command: path.join(tmpHome, 'agent-notifier-runtime') },
-            claudeManagedCommand: '/bin/bash /tmp/claude-stop.sh',
+            codexStopCommand: "/bin/bash '/tmp/codex-stop.sh'",
+            codexPermissionCommand: "/bin/bash '/tmp/codex-permission-request.sh'",
+            claudeStopCommand: "/bin/bash '/tmp/claude-stop.sh'",
+            claudePermissionPromptCommand: "/bin/bash '/tmp/claude-notification.sh'",
             detectedOtherClaudeStopHooksAtInstall: 0,
-            wrapperVersion: 2,
+            detectedOtherClaudePermissionPromptHooksAtInstall: 0,
+            wrapperVersion: 3,
         };
         hookStatus = {
-            codexConfigured: true,
-            claudeConfigured: true,
+            codexCompletionConfigured: true,
+            codexApprovalConfigured: true,
+            claudeCompletionConfigured: true,
+            claudeApprovalConfigured: true,
+            codexRuntimeMode: 'hooks-first',
+            codexHooksFeatureEnabled: true,
+            externalCodexNotifyConfigured: false,
             otherClaudeStopHooks: 0,
+            otherClaudePermissionPromptHooks: 0,
             manifestPresent: true,
             staleWrapperVersionDetected: false,
         };
@@ -127,16 +160,16 @@ describe('buildDoctorReport', () => {
             reservedCount: 0,
             backupCount: 0,
             lastFinalized: {
-                schemaVersion: 2,
+                schemaVersion: 3,
                 eventId: 'evt-1',
                 eventIdHash: 'hash',
-                source: 'codex-notify',
+                source: 'codex-stop',
                 agentType: 'codex',
-                outcome: 'completed',
+                kind: 'turn-complete',
                 workspacePath: '/tmp/project',
                 projectName: 'project',
                 windowId: 'win',
-                completedAt: '2026-04-17T00:00:00.000Z',
+                occurredAt: '2026-04-17T00:00:00.000Z',
                 processingState: 'backend-accepted',
                 reservedAt: '2026-04-17T00:00:00.000Z',
                 updatedAt: '2026-04-17T00:00:01.000Z',
@@ -159,17 +192,20 @@ describe('buildDoctorReport', () => {
         vi.resetModules();
     });
 
-    it('reports healthy install and includes ledger/runtime summaries', async () => {
+    it('reports healthy hooks-first install and includes runtime summaries', async () => {
         const { buildDoctorReport } = await import('../../src/commands/doctor.js');
         const report = await buildDoctorReport();
 
         expect(report.hasCriticalFailures).toBe(false);
         expect(report.sections[1]?.lines.some(line => line.text.includes('Shim resolves a live agent-notifier runtime.'))).toBe(true);
+        expect(report.sections[1]?.lines.some(line => line.text.includes('Codex hooks.json exists'))).toBe(true);
+        expect(report.sections[2]?.lines.some(line => line.text.includes('Codex approval path is configured.'))).toBe(true);
         expect(report.sections[4]?.lines.some(line => line.text.includes('Finalized markers: 5'))).toBe(true);
+        expect(report.sections[4]?.lines.some(line => line.text.includes('Last finalized event: codex project (turn-complete, backend-accepted)'))).toBe(true);
         expect(report.sections[5]?.lines.some(line => line.text.includes('backend accepted: 1'))).toBe(true);
     });
 
-    it('treats broken shim target and missing terminal-notifier as critical failures', async () => {
+    it('treats broken runtime and missing provider paths as critical failures', async () => {
         execMock = async (command, args) => {
             if (command.endsWith('agent-notifier-shim')) {
                 return { stdout: '', stderr: 'broken', exitCode: 1 };
@@ -181,8 +217,11 @@ describe('buildDoctorReport', () => {
         };
         hookStatus = {
             ...hookStatus,
+            codexApprovalConfigured: false,
             otherClaudeStopHooks: 2,
-            codexManagedMode: 'chain-existing',
+            otherClaudePermissionPromptHooks: 1,
+            externalCodexNotifyConfigured: true,
+            codexRuntimeMode: 'hybrid',
             staleWrapperVersionDetected: true,
         };
         legacyDaemonRunning = true;
@@ -193,7 +232,8 @@ describe('buildDoctorReport', () => {
         expect(report.hasCriticalFailures).toBe(true);
         expect(report.sections[1]?.lines.some(line => line.text.includes('Shim could not resolve'))).toBe(true);
         expect(report.sections[1]?.lines.some(line => line.text.includes('terminal-notifier is missing'))).toBe(true);
-        expect(report.sections[3]?.lines.some(line => line.text.includes('chain-existing'))).toBe(true);
-        expect(report.sections[3]?.lines.some(line => line.text.includes('Legacy daemon'))).toBe(true);
+        expect(report.sections[2]?.lines.some(line => line.text.includes('Codex approval path is missing.'))).toBe(true);
+        expect(report.sections[3]?.lines.some(line => line.text.includes('hybrid mode'))).toBe(true);
+        expect(report.sections[3]?.lines.some(line => line.text.includes('Legacy daemon is still running'))).toBe(true);
     });
 });

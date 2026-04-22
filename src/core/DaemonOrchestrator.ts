@@ -68,13 +68,12 @@ function toLegacyTurnEvent(session: AgentSession) {
     return {
         eventId: `legacy-process-exit:${session.pid}:${session.completedAt ?? session.discoveredAt}`,
         source: 'legacy-process-exit' as const,
-        outcome: 'completed' as const,
+        kind: 'turn-complete' as const,
         agentType: session.agentType,
         workspacePath: session.workspacePath,
         projectName: session.projectName,
         windowId: session.windowId,
-        completedAt: session.completedAt ?? new Date().toISOString(),
-        state: 'completed' as const,
+        occurredAt: session.completedAt ?? new Date().toISOString(),
         ...(session.gitBranch ? { gitBranch: session.gitBranch } : {}),
     };
 }

@@ -100,7 +100,8 @@ export async function installCommand(): Promise<void> {
     await launchAgent.uninstall().catch(() => undefined);
 
     console.log('✓ Agent Notifier installed in hook-first mode.');
-    console.log('  Codex notify and Claude Stop hooks were configured through the managed shim.');
+    console.log('  Codex Stop and PermissionRequest hooks were configured through the managed shim.');
+    console.log('  Claude Stop and permission_prompt Notification hooks were configured through the managed shim.');
     console.log('  Legacy LaunchAgent was stopped to avoid duplicate completion models.');
     for (const warning of installResult.warnings) {
         console.log(`  Warning: ${warning}`);

@@ -2,13 +2,16 @@ import fs from 'node:fs/promises';
 import { loadConfig } from '../infra/Config.js';
 import { CommandExecutor } from '../infra/CommandExecutor.js';
 import { Logger } from '../infra/Logger.js';
-import { buildAgentTurnEvent } from '../core/EventIdentity.js';
+import { buildAgentAttentionEvent } from '../core/EventIdentity.js';
 import { EventLedger } from '../core/EventLedger.js';
 import {
+    parseClaudeNotificationPayloadDetailed,
     parseClaudeStopPayloadDetailed,
     parseCodexNotifyPayloadDetailed,
+    parseCodexPermissionRequestPayloadDetailed,
+    parseCodexStopPayloadDetailed,
 } from '../core/HookEventParser.js';
-import { NotificationService } from '../core/NotificationService.js';
+import { buildNotificationContent, NotificationService } from '../core/NotificationService.js';
 import type { HookEventCandidate, NotificationSendResult } from '../types.js';
 import {
     getConfigDir,
@@ -17,13 +20,22 @@ import {
     getLogsDir,
 } from '../utils/paths.js';
 
+type ManagedHookEvent =
+    | 'codex'
+    | 'codex-notify'
+    | 'codex-stop'
+    | 'codex-permission-request'
+    | 'claude'
+    | 'claude-stop'
+    | 'claude-notification';
+
 export async function hookCommand(options: { agent?: string; payload?: string }): Promise<void> {
-    const agent = options.agent;
-    if (agent !== 'claude' && agent !== 'codex') {
-        throw new Error(`Unsupported hook agent: ${agent ?? 'unknown'}`);
+    const hookEvent = normalizeHookEvent(options.agent);
+    if (!hookEvent) {
+        throw new Error(`Unsupported hook agent: ${options.agent ?? 'unknown'}`);
     }
 
-    const payload = agent === 'claude'
+    const payload = readsPayloadFromStdin(hookEvent)
         ? await readStdin()
         : (options.payload ?? '');
 
@@ -39,21 +51,18 @@ export async function hookCommand(options: { agent?: string; payload?: string })
 
     try {
         logger.info('hook:received', {
-            agentType: agent,
+            hookEvent,
             payloadBytes: Buffer.byteLength(payload),
         });
 
-        const parsed = agent === 'claude'
-            ? parseClaudeStopPayloadDetailed(payload)
-            : parseCodexNotifyPayloadDetailed(payload, process.cwd());
-
+        const parsed = parseHookPayload(hookEvent, payload);
         for (const warning of parsed.warnings) {
-            logger.debug(warning, { agentType: agent });
+            logger.debug(warning, { hookEvent });
         }
 
         if (!parsed.candidate) {
             logger.debug('hook:parse-rejected', {
-                agentType: agent,
+                hookEvent,
                 reason: parsed.rejectionReason ?? 'unknown',
             });
             return;
@@ -68,7 +77,7 @@ export async function hookCommand(options: { agent?: string; payload?: string })
         const executor = new CommandExecutor();
         const ledger = new EventLedger(config, logger);
         const notifier = new NotificationService(executor, logger, getFocusScriptPath(), config.notificationSound);
-        const event = await buildAgentTurnEvent(candidate, {
+        const event = await buildAgentAttentionEvent(candidate, {
             showGitBranch: config.showGitBranch,
             executor,
             logger,
@@ -90,15 +99,14 @@ export async function hookCommand(options: { agent?: string; payload?: string })
         try {
             sendResult = await notifier.send(event);
         } catch (error) {
+            const content = buildNotificationContent(event);
             sendResult = {
                 outcome: 'backend-failed',
                 backend: 'none',
                 fallbackUsed: false,
                 stderr: String(error),
-                title: event.outcome === 'failed'
-                    ? `${event.agentType} stopped with error`
-                    : `${event.agentType} replied`,
-                message: event.projectName,
+                title: content.title,
+                message: content.message,
                 clickActionEnabled: false,
             };
         }
@@ -115,17 +123,65 @@ export async function hookCommand(options: { agent?: string; payload?: string })
 
         logger.info(mapNotificationMessage(sendResult), {
             ...buildLogMeta(event),
-            outcome: event.outcome,
+            kind: event.kind,
         });
     } finally {
         logger.close();
     }
 }
 
+function normalizeHookEvent(value: string | undefined): ManagedHookEvent | null {
+    switch (value) {
+        case 'codex':
+        case 'codex-notify':
+        case 'codex-stop':
+        case 'codex-permission-request':
+        case 'claude':
+        case 'claude-stop':
+        case 'claude-notification':
+            return value;
+        default:
+            return null;
+    }
+}
+
+function readsPayloadFromStdin(hookEvent: ManagedHookEvent): boolean {
+    switch (hookEvent) {
+        case 'codex-stop':
+        case 'codex-permission-request':
+        case 'claude':
+        case 'claude-stop':
+        case 'claude-notification':
+            return true;
+        case 'codex':
+        case 'codex-notify':
+            return false;
+    }
+}
+
+function parseHookPayload(hookEvent: ManagedHookEvent, payload: string) {
+    switch (hookEvent) {
+        case 'codex':
+        case 'codex-notify':
+            return parseCodexNotifyPayloadDetailed(payload, process.cwd());
+        case 'codex-stop':
+            return parseCodexStopPayloadDetailed(payload);
+        case 'codex-permission-request':
+            return parseCodexPermissionRequestPayloadDetailed(payload);
+        case 'claude':
+        case 'claude-stop':
+            return parseClaudeStopPayloadDetailed(payload);
+        case 'claude-notification':
+            return parseClaudeNotificationPayloadDetailed(payload);
+    }
+}
+
 function shouldSuppressSemantically(candidate: HookEventCandidate): boolean {
-    return candidate.source === 'claude-stop'
+    return (
+        (candidate.source === 'claude-stop' || candidate.source === 'codex-stop')
         && candidate.providerEvent?.hookEventName === 'Stop'
-        && candidate.providerEvent.claudeStopHookActive === true;
+        && candidate.providerEvent.stopHookActive === true
+    );
 }
 
 function mapNotificationMessage(result: NotificationSendResult): string {
@@ -139,19 +195,18 @@ function mapNotificationMessage(result: NotificationSendResult): string {
     }
 }
 
-function buildLogMeta(candidate: Pick<HookEventCandidate, 'agentType' | 'source' | 'workspacePath' | 'providerSessionId'> & {
+function buildLogMeta(candidate: Pick<HookEventCandidate, 'agentType' | 'source' | 'workspacePath' | 'providerSessionId' | 'kind'> & {
     readonly projectName?: string;
     readonly eventId?: string;
-    readonly outcome?: string;
 }): Record<string, unknown> {
     return {
         ...(candidate.eventId ? { eventId: candidate.eventId } : {}),
         agentType: candidate.agentType,
         source: candidate.source,
+        kind: candidate.kind,
         workspacePath: candidate.workspacePath,
         ...(candidate.projectName ? { projectName: candidate.projectName } : {}),
         ...(candidate.providerSessionId ? { providerSessionId: candidate.providerSessionId } : {}),
-        ...(candidate.outcome ? { outcome: candidate.outcome } : {}),
     };
 }
 

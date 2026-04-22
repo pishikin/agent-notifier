@@ -2,11 +2,17 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AgentTurnEvent, HookEventCandidate, NotificationSendResult, ReservationResult } from '../../src/types.js';
+import type {
+    AgentAttentionEvent,
+    EventMarker,
+    HookEventCandidate,
+    NotificationSendResult,
+    ReservationResult,
+} from '../../src/types.js';
 
 let tmpHome = '';
 let parseResult: { candidate: HookEventCandidate | null; rejectionReason?: string; warnings: string[] };
-let builtEvent: AgentTurnEvent;
+let builtEvent: AgentAttentionEvent;
 let reserveResult: ReservationResult;
 let sendResult: NotificationSendResult;
 const reserveSpy = vi.fn();
@@ -41,11 +47,14 @@ vi.mock('../../src/infra/Logger.js', () => ({
 
 vi.mock('../../src/core/HookEventParser.js', () => ({
     parseCodexNotifyPayloadDetailed: () => parseResult,
+    parseCodexStopPayloadDetailed: () => parseResult,
+    parseCodexPermissionRequestPayloadDetailed: () => parseResult,
     parseClaudeStopPayloadDetailed: () => parseResult,
+    parseClaudeNotificationPayloadDetailed: () => parseResult,
 }));
 
 vi.mock('../../src/core/EventIdentity.js', () => ({
-    buildAgentTurnEvent: () => Promise.resolve(builtEvent),
+    buildAgentAttentionEvent: () => Promise.resolve(builtEvent),
 }));
 
 vi.mock('../../src/core/EventLedger.js', () => ({
@@ -68,6 +77,10 @@ vi.mock('../../src/core/NotificationService.js', () => ({
             return sendResult;
         }
     },
+    buildNotificationContent: () => ({
+        title: 'fallback title',
+        message: 'fallback message',
+    }),
 }));
 
 vi.mock('../../src/utils/paths.js', () => ({
@@ -77,19 +90,36 @@ vi.mock('../../src/utils/paths.js', () => ({
     getFocusScriptPath: () => path.join(tmpHome, 'focus-window.sh'),
 }));
 
+function makeDuplicateMarker(): EventMarker {
+    return {
+        schemaVersion: 3,
+        eventId: 'evt-1',
+        eventIdHash: 'hash',
+        source: 'codex-stop',
+        agentType: 'codex',
+        kind: 'turn-complete',
+        workspacePath: '/tmp/project',
+        projectName: 'project',
+        windowId: 'win1',
+        occurredAt: '2026-04-17T00:00:00.000Z',
+        processingState: 'backend-accepted',
+        reservedAt: '2026-04-17T00:00:00.000Z',
+        updatedAt: '2026-04-17T00:00:01.000Z',
+    };
+}
+
 describe('hookCommand', () => {
     beforeEach(async () => {
         tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-notifier-hook-'));
         parseResult = { candidate: null, rejectionReason: 'invalid', warnings: [] };
         builtEvent = {
             eventId: 'evt-1',
-            source: 'claude-stop',
-            outcome: 'completed',
-            agentType: 'claude',
+            source: 'codex-stop',
+            kind: 'turn-complete',
+            agentType: 'codex',
             workspacePath: '/tmp/project',
             projectName: 'project',
-            completedAt: '2026-04-17T00:00:00.000Z',
-            state: 'completed',
+            occurredAt: '2026-04-17T00:00:00.000Z',
             windowId: 'win1',
         };
         reserveResult = { kind: 'owned', markerPath: '/tmp/marker.json' };
@@ -98,7 +128,7 @@ describe('hookCommand', () => {
             backend: 'terminal-notifier',
             fallbackUsed: false,
             primaryExitCode: 0,
-            title: 'claude replied',
+            title: 'codex replied',
             message: 'project',
             clickActionEnabled: true,
         };
@@ -121,18 +151,17 @@ describe('hookCommand', () => {
         expect(finalizeSpy).not.toHaveBeenCalled();
     });
 
-    it('suppresses Claude stop_hook_active events before reservation', async () => {
+    it('suppresses Stop events while a stop hook is already active', async () => {
         parseResult = {
             candidate: {
-                agentType: 'claude',
-                source: 'claude-stop',
-                outcome: 'completed',
-                dedupeKeyHint: 'x',
+                agentType: 'codex',
+                source: 'codex-stop',
+                kind: 'turn-complete',
+                dedupeKeyHint: 'turn-1',
                 workspacePath: '/tmp/project',
-                providerSessionId: 'session-1',
                 providerEvent: {
                     hookEventName: 'Stop',
-                    claudeStopHookActive: true,
+                    stopHookActive: true,
                 },
             },
             warnings: [],
@@ -143,6 +172,7 @@ describe('hookCommand', () => {
 
         expect(reserveSpy).not.toHaveBeenCalled();
         expect(sendSpy).not.toHaveBeenCalled();
+        expect(finalizeSpy).not.toHaveBeenCalled();
     });
 
     it('suppresses duplicate reservations without sending notifications', async () => {
@@ -150,7 +180,7 @@ describe('hookCommand', () => {
             candidate: {
                 agentType: 'codex',
                 source: 'codex-notify',
-                outcome: 'completed',
+                kind: 'turn-complete',
                 dedupeKeyHint: 'turn-1',
                 workspacePath: '/tmp/project',
             },
@@ -158,21 +188,7 @@ describe('hookCommand', () => {
         };
         reserveResult = {
             kind: 'duplicate',
-            existing: {
-                schemaVersion: 2,
-                eventId: 'evt-1',
-                eventIdHash: 'hash',
-                source: 'codex-notify',
-                agentType: 'codex',
-                outcome: 'completed',
-                workspacePath: '/tmp/project',
-                projectName: 'project',
-                windowId: 'win1',
-                completedAt: '2026-04-17T00:00:00.000Z',
-                processingState: 'backend-accepted',
-                reservedAt: '2026-04-17T00:00:00.000Z',
-                updatedAt: '2026-04-17T00:00:01.000Z',
-            },
+            existing: makeDuplicateMarker(),
         };
 
         const { hookCommand } = await import('../../src/commands/hook.js');
@@ -183,12 +199,47 @@ describe('hookCommand', () => {
         expect(finalizeSpy).not.toHaveBeenCalled();
     });
 
+    it('sends and finalizes approval-request events', async () => {
+        parseResult = {
+            candidate: {
+                agentType: 'codex',
+                source: 'codex-permission-request',
+                kind: 'approval-request',
+                dedupeKeyHint: 'approval-1',
+                workspacePath: '/tmp/project',
+                providerEvent: {
+                    hookEventName: 'PermissionRequest',
+                    toolName: 'Bash',
+                    toolDescription: 'Run npm install',
+                },
+            },
+            warnings: [],
+        };
+        builtEvent = {
+            ...builtEvent,
+            source: 'codex-permission-request',
+            kind: 'approval-request',
+            providerEvent: {
+                hookEventName: 'PermissionRequest',
+                toolName: 'Bash',
+                toolDescription: 'Run npm install',
+            },
+        };
+
+        const { hookCommand } = await import('../../src/commands/hook.js');
+        await hookCommand({ agent: 'codex', payload: '{}' });
+
+        expect(reserveSpy).toHaveBeenCalledTimes(1);
+        expect(sendSpy).toHaveBeenCalledTimes(1);
+        expect(finalizeSpy).toHaveBeenCalledTimes(1);
+    });
+
     it('finalizes markers even when notification backend reports failure', async () => {
         parseResult = {
             candidate: {
                 agentType: 'codex',
                 source: 'codex-notify',
-                outcome: 'completed',
+                kind: 'turn-complete',
                 dedupeKeyHint: 'turn-1',
                 workspacePath: '/tmp/project',
             },

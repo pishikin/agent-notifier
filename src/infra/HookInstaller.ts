@@ -3,27 +3,41 @@ import path from 'node:path';
 import type { HookInstallState, HookStatus, ICommandExecutor, InstallManifest } from '../types.js';
 import { resolveCurrentRuntime, shellJoinArgs } from './CliInvocation.js';
 import {
+    countClaudePermissionPromptHooks,
     countClaudeStopHooks,
+    hasClaudePermissionPromptHook,
     hasClaudeStopHook,
+    hasCodexCommandHook,
+    inspectCodexHooksFeature,
     inspectCodexNotifyConfig,
     parseClaudeSettings,
+    parseCodexHooksSettings,
+    removeClaudePermissionPromptHook,
     removeClaudeStopHook,
+    removeCodexCommandHook,
+    restoreCodexHooksFeature,
     restoreCodexNotify,
     serializeClaudeSettings,
+    serializeCodexHooksSettings,
+    upsertClaudePermissionPromptHook,
     upsertClaudeStopHook,
-    upsertCodexNotify,
+    upsertCodexCommandHook,
+    upsertCodexHooksFeature,
 } from './HookConfig.js';
 import {
     getBinDir,
     getClaudeHookWrapperPath,
+    getClaudeNotificationHookWrapperPath,
     getClaudeSettingsPath,
     getCodexConfigPath,
     getCodexHookWrapperPath,
+    getCodexHooksPath,
     getCodexLegacyNotifyPath,
+    getCodexPermissionHookWrapperPath,
+    getCodexStopHookWrapperPath,
     getConfigDir,
     getHookInstallStatePath,
     getHooksDir,
-    getHooksLogPath,
     getHooksWrapperLogPath,
     getInstallManifestPath,
     getLogsDir,
@@ -31,7 +45,7 @@ import {
 } from '../utils/paths.js';
 
 const BASH_PATH = '/bin/bash';
-const WRAPPER_VERSION = 2;
+const WRAPPER_VERSION = 3;
 
 export interface HookInstallResult {
     readonly manifest: InstallManifest;
@@ -40,6 +54,8 @@ export interface HookInstallResult {
 
 export interface HookUninstallResult {
     readonly restoredCodexNotify: boolean;
+    readonly restoredCodexHooksFeature: boolean;
+    readonly removedCodexHooks: boolean;
     readonly removedManifest: boolean;
 }
 
@@ -53,57 +69,97 @@ export class HookInstaller {
         await fs.mkdir(getLogsDir(), { recursive: true });
 
         const runtime = await resolveCurrentRuntime(this.executor);
+        const existingManifest = await this.loadManifest();
         const managedNotifyArgs = this.getManagedCodexNotifyArgs();
         const rawCodexConfig = await readFileIfExists(getCodexConfigPath()) ?? '';
         const codexInspection = inspectCodexNotifyConfig(rawCodexConfig);
-        if (codexInspection.state === 'unsupported') {
-            throw new Error('Unsupported Codex notify format. Only single-line notify = [...] can be updated safely.');
+        const codexHooksFeatureStateBeforeInstall = inspectCodexHooksFeature(rawCodexConfig);
+        const currentNotifyIsManaged = codexInspection.state === 'supported'
+            && arraysEqual(codexInspection.notifyArgs, managedNotifyArgs);
+
+        const codexOriginalNotify = currentNotifyIsManaged
+            ? existingManifest?.codexOriginalNotify
+            : (codexInspection.state === 'supported' ? codexInspection.notifyArgs ?? undefined : undefined);
+
+        let nextCodexConfig = upsertCodexHooksFeature(rawCodexConfig, true);
+        if (currentNotifyIsManaged) {
+            nextCodexConfig = restoreCodexNotify(nextCodexConfig, managedNotifyArgs, existingManifest?.codexOriginalNotify);
         }
 
-        const codexOriginalNotify = codexInspection.notifyArgs && !arraysEqual(codexInspection.notifyArgs, managedNotifyArgs)
-            ? codexInspection.notifyArgs
-            : undefined;
-        const codexManagedMode = codexOriginalNotify ? 'chain-existing' : 'exclusive-managed';
+        const rawCodexHooks = await readFileIfExists(getCodexHooksPath()) ?? '{}';
+        const parsedCodexHooks = parseCodexHooksSettings(rawCodexHooks);
+        const codexStopCommand = this.getCodexStopHookCommand();
+        const codexPermissionCommand = this.getCodexPermissionHookCommand();
+        const nextCodexHooks = upsertCodexCommandHook(
+            upsertCodexCommandHook(parsedCodexHooks, 'Stop', codexStopCommand),
+            'PermissionRequest',
+            codexPermissionCommand,
+            { statusMessage: 'Checking approval request' },
+        );
 
         const rawClaudeSettings = await readFileIfExists(getClaudeSettingsPath()) ?? '{}';
         const parsedClaudeSettings = parseClaudeSettings(rawClaudeSettings);
-        const claudeManagedCommand = this.getClaudeHookCommand();
-        const claudeStopCounts = countClaudeStopHooks(parsedClaudeSettings, claudeManagedCommand);
+        const claudeStopCommand = this.getClaudeStopHookCommand();
+        const claudePermissionPromptCommand = this.getClaudeNotificationHookCommand();
+        const claudeStopCounts = countClaudeStopHooks(parsedClaudeSettings, claudeStopCommand);
+        const claudePermissionPromptCounts = countClaudePermissionPromptHooks(
+            parsedClaudeSettings,
+            claudePermissionPromptCommand,
+        );
+        const nextClaudeSettings = upsertClaudePermissionPromptHook(
+            upsertClaudeStopHook(parsedClaudeSettings, claudeStopCommand),
+            claudePermissionPromptCommand,
+        );
 
         const manifest: InstallManifest = {
-            schemaVersion: 2,
+            schemaVersion: 3,
             installedAt: new Date().toISOString(),
-            codexManagedMode,
+            codexRuntimeMode: 'hooks-first',
+            codexHooksFeatureStateBeforeInstall,
             shimPath: getShimPath(),
             runtime,
-            claudeManagedCommand,
+            codexStopCommand,
+            codexPermissionCommand,
+            claudeStopCommand,
+            claudePermissionPromptCommand,
             detectedOtherClaudeStopHooksAtInstall: claudeStopCounts.other,
-            wrapperVersion: 2,
+            detectedOtherClaudePermissionPromptHooksAtInstall: claudePermissionPromptCounts.other,
+            wrapperVersion: WRAPPER_VERSION,
             ...(codexOriginalNotify ? { codexOriginalNotify } : {}),
         };
 
         await this.writeManifest(manifest);
         await this.writeShim();
         await this.writeCodexLegacyWrapper(codexOriginalNotify);
-        await this.writeCodexWrapper();
-        await this.writeClaudeWrapper();
+        await this.writeCodexNotifyWrapper();
+        await this.writeCodexStopWrapper();
+        await this.writeCodexPermissionWrapper();
+        await this.writeClaudeStopWrapper();
+        await this.writeClaudeNotificationWrapper();
 
-        const nextCodexConfig = upsertCodexNotify(rawCodexConfig, managedNotifyArgs);
         await fs.mkdir(path.dirname(getCodexConfigPath()), { recursive: true });
         await fs.writeFile(getCodexConfigPath(), nextCodexConfig, 'utf8');
 
-        const nextClaudeSettings = upsertClaudeStopHook(parsedClaudeSettings, claudeManagedCommand);
+        await fs.mkdir(path.dirname(getCodexHooksPath()), { recursive: true });
+        await fs.writeFile(getCodexHooksPath(), serializeCodexHooksSettings(nextCodexHooks), 'utf8');
+
         await fs.mkdir(path.dirname(getClaudeSettingsPath()), { recursive: true });
         await fs.writeFile(getClaudeSettingsPath(), serializeClaudeSettings(nextClaudeSettings), 'utf8');
 
         await fs.rm(getHookInstallStatePath(), { force: true });
 
         const warnings: string[] = [];
-        if (codexManagedMode === 'chain-existing') {
-            warnings.push('Existing Codex notify command detected; it will be chained after the managed notifier and may still produce desktop notifications.');
+        if (codexInspection.state === 'supported' && !currentNotifyIsManaged) {
+            warnings.push('Existing Codex notify command was left untouched and may still produce extra desktop notifications.');
+        }
+        if (codexInspection.state === 'unsupported') {
+            warnings.push('Codex notify config uses an unsupported format and was left untouched.');
         }
         if (claudeStopCounts.other > 0) {
-            warnings.push(`Detected ${claudeStopCounts.other} other Claude Stop hook(s); Claude completion timing becomes best-effort when multiple Stop hooks coexist.`);
+            warnings.push(`Detected ${claudeStopCounts.other} other Claude Stop hook(s); completion timing becomes best-effort when multiple Stop hooks coexist.`);
+        }
+        if (claudePermissionPromptCounts.other > 0) {
+            warnings.push(`Detected ${claudePermissionPromptCounts.other} other Claude permission_prompt Notification hook(s); duplicate approval notifications are possible.`);
         }
 
         return { manifest, warnings };
@@ -116,20 +172,58 @@ export class HookInstaller {
         const rawCodexConfig = await readFileIfExists(getCodexConfigPath());
 
         let restoredCodexNotify = false;
+        let restoredCodexHooksFeature = false;
         if (rawCodexConfig !== null) {
-            const nextConfig = restoreCodexNotify(
+            let nextConfig = restoreCodexNotify(
                 rawCodexConfig,
                 managedNotifyArgs,
                 manifest?.codexOriginalNotify ?? legacyState?.codexOriginalNotify,
             );
             restoredCodexNotify = nextConfig !== rawCodexConfig;
+
+            if (manifest?.codexHooksFeatureStateBeforeInstall) {
+                const restoredFeatureConfig = restoreCodexHooksFeature(
+                    nextConfig,
+                    manifest.codexHooksFeatureStateBeforeInstall,
+                );
+                restoredCodexHooksFeature = restoredFeatureConfig !== nextConfig;
+                nextConfig = restoredFeatureConfig;
+            }
+
             await fs.writeFile(getCodexConfigPath(), nextConfig, 'utf8');
+        }
+
+        let removedCodexHooks = false;
+        const rawCodexHooks = await readFileIfExists(getCodexHooksPath());
+        if (rawCodexHooks !== null) {
+            const parsedCodexHooks = parseCodexHooksSettings(rawCodexHooks);
+            const nextCodexHooks = removeCodexCommandHook(
+                removeCodexCommandHook(
+                    parsedCodexHooks,
+                    'Stop',
+                    manifest?.codexStopCommand ?? this.getCodexStopHookCommand(),
+                ),
+                'PermissionRequest',
+                manifest?.codexPermissionCommand ?? this.getCodexPermissionHookCommand(),
+            );
+            removedCodexHooks = JSON.stringify(nextCodexHooks) !== JSON.stringify(parsedCodexHooks);
+            if (hasConfiguredCodexHooks(nextCodexHooks)) {
+                await fs.writeFile(getCodexHooksPath(), serializeCodexHooksSettings(nextCodexHooks), 'utf8');
+            } else {
+                await fs.rm(getCodexHooksPath(), { force: true });
+            }
         }
 
         const rawClaudeSettings = await readFileIfExists(getClaudeSettingsPath());
         if (rawClaudeSettings !== null) {
             const parsed = parseClaudeSettings(rawClaudeSettings);
-            const nextSettings = removeClaudeStopHook(parsed, manifest?.claudeManagedCommand ?? this.getClaudeHookCommand());
+            const nextSettings = removeClaudePermissionPromptHook(
+                removeClaudeStopHook(
+                    parsed,
+                    manifest?.claudeStopCommand ?? this.getClaudeStopHookCommand(),
+                ),
+                manifest?.claudePermissionPromptCommand ?? this.getClaudeNotificationHookCommand(),
+            );
             await fs.writeFile(getClaudeSettingsPath(), serializeClaudeSettings(nextSettings), 'utf8');
         }
 
@@ -139,6 +233,8 @@ export class HookInstaller {
 
         return {
             restoredCodexNotify,
+            restoredCodexHooksFeature,
+            removedCodexHooks,
             removedManifest: true,
         };
     }
@@ -148,33 +244,75 @@ export class HookInstaller {
         const managedCodexNotify = this.getManagedCodexNotifyArgs();
         const codexConfig = await readFileIfExists(getCodexConfigPath());
         const codexInspection = inspectCodexNotifyConfig(codexConfig ?? '');
-        const claudeSettingsRaw = await readFileIfExists(getClaudeSettingsPath());
-        const claudeCommand = manifest?.claudeManagedCommand ?? this.getClaudeHookCommand();
-
-        const codexConfigured = codexInspection.state === 'supported'
+        const codexHooksFeatureEnabled = inspectCodexHooksFeature(codexConfig ?? '') === 'enabled';
+        const legacyManagedNotifyConfigured = codexInspection.state === 'supported'
             && arraysEqual(codexInspection.notifyArgs, managedCodexNotify);
+        const externalCodexNotifyConfigured = codexInspection.state === 'unsupported'
+            || (codexInspection.state === 'supported' && !legacyManagedNotifyConfigured);
 
-        let claudeConfigured = false;
+        const codexHooksRaw = await readFileIfExists(getCodexHooksPath());
+        let codexStopConfigured = false;
+        let codexPermissionConfigured = false;
+        if (codexHooksRaw) {
+            try {
+                const parsedHooks = parseCodexHooksSettings(codexHooksRaw);
+                codexStopConfigured = hasCodexCommandHook(
+                    parsedHooks,
+                    'Stop',
+                    manifest?.codexStopCommand ?? this.getCodexStopHookCommand(),
+                );
+                codexPermissionConfigured = hasCodexCommandHook(
+                    parsedHooks,
+                    'PermissionRequest',
+                    manifest?.codexPermissionCommand ?? this.getCodexPermissionHookCommand(),
+                );
+            } catch {
+                codexStopConfigured = false;
+                codexPermissionConfigured = false;
+            }
+        }
+
+        const claudeSettingsRaw = await readFileIfExists(getClaudeSettingsPath());
+        const claudeStopCommand = manifest?.claudeStopCommand ?? this.getClaudeStopHookCommand();
+        const claudePermissionPromptCommand = manifest?.claudePermissionPromptCommand ?? this.getClaudeNotificationHookCommand();
+
+        let claudeCompletionConfigured = false;
+        let claudeApprovalConfigured = false;
         let otherClaudeStopHooks = 0;
+        let otherClaudePermissionPromptHooks = 0;
         if (claudeSettingsRaw) {
             try {
                 const parsedSettings = parseClaudeSettings(claudeSettingsRaw);
-                claudeConfigured = hasClaudeStopHook(parsedSettings, claudeCommand);
-                otherClaudeStopHooks = countClaudeStopHooks(parsedSettings, claudeCommand).other;
+                claudeCompletionConfigured = hasClaudeStopHook(parsedSettings, claudeStopCommand);
+                claudeApprovalConfigured = hasClaudePermissionPromptHook(parsedSettings, claudePermissionPromptCommand);
+                otherClaudeStopHooks = countClaudeStopHooks(parsedSettings, claudeStopCommand).other;
+                otherClaudePermissionPromptHooks = countClaudePermissionPromptHooks(
+                    parsedSettings,
+                    claudePermissionPromptCommand,
+                ).other;
             } catch {
-                claudeConfigured = false;
+                claudeCompletionConfigured = false;
+                claudeApprovalConfigured = false;
             }
         }
 
         const staleWrapperVersionDetected = await this.hasStaleWrapperVersion();
+        const codexRuntimeMode = codexHooksFeatureEnabled && (codexStopConfigured || codexPermissionConfigured)
+            ? (legacyManagedNotifyConfigured ? 'hybrid' : 'hooks-first')
+            : (legacyManagedNotifyConfigured ? 'notify-fallback' : undefined);
 
         return {
-            codexConfigured,
-            claudeConfigured,
+            codexCompletionConfigured: (codexHooksFeatureEnabled && codexStopConfigured) || legacyManagedNotifyConfigured,
+            codexApprovalConfigured: codexHooksFeatureEnabled && codexPermissionConfigured,
+            claudeCompletionConfigured,
+            claudeApprovalConfigured,
+            codexHooksFeatureEnabled,
+            externalCodexNotifyConfigured,
             otherClaudeStopHooks,
+            otherClaudePermissionPromptHooks,
             manifestPresent: manifest !== null,
             staleWrapperVersionDetected,
-            ...(manifest?.codexManagedMode ? { codexManagedMode: manifest.codexManagedMode } : {}),
+            ...(codexRuntimeMode ? { codexRuntimeMode } : {}),
         };
     }
 
@@ -191,71 +329,12 @@ export class HookInstaller {
             }
 
             const record = parsed as Record<string, unknown>;
-            if (record.schemaVersion !== 2) {
-                return null;
+            if (record.schemaVersion === 3) {
+                return readManifestV3(record);
             }
 
-            const runtime = record.runtime;
-            if (!runtime || typeof runtime !== 'object' || Array.isArray(runtime)) {
-                return null;
-            }
-
-            if (
-                record.codexManagedMode !== 'chain-existing'
-                && record.codexManagedMode !== 'exclusive-managed'
-            ) {
-                return null;
-            }
-
-            if (
-                record.wrapperVersion !== WRAPPER_VERSION
-                || typeof record.installedAt !== 'string'
-                || typeof record.shimPath !== 'string'
-                || typeof record.claudeManagedCommand !== 'string'
-                || typeof record.detectedOtherClaudeStopHooksAtInstall !== 'number'
-            ) {
-                return null;
-            }
-
-            if ((runtime as Record<string, unknown>).kind === 'binary' && typeof (runtime as Record<string, unknown>).command === 'string') {
-                const codexOriginalNotify = readStringArray(record.codexOriginalNotify);
-                return {
-                    schemaVersion: 2,
-                    installedAt: record.installedAt,
-                    codexManagedMode: record.codexManagedMode,
-                    shimPath: record.shimPath,
-                    runtime: {
-                        kind: 'binary',
-                        command: (runtime as Record<string, unknown>).command as string,
-                    },
-                    claudeManagedCommand: record.claudeManagedCommand,
-                    detectedOtherClaudeStopHooksAtInstall: record.detectedOtherClaudeStopHooksAtInstall,
-                    wrapperVersion: 2,
-                    ...(codexOriginalNotify ? { codexOriginalNotify } : {}),
-                };
-            }
-
-            if (
-                (runtime as Record<string, unknown>).kind === 'node'
-                && typeof (runtime as Record<string, unknown>).nodePath === 'string'
-                && typeof (runtime as Record<string, unknown>).entryPath === 'string'
-            ) {
-                const codexOriginalNotify = readStringArray(record.codexOriginalNotify);
-                return {
-                    schemaVersion: 2,
-                    installedAt: record.installedAt,
-                    codexManagedMode: record.codexManagedMode,
-                    shimPath: record.shimPath,
-                    runtime: {
-                        kind: 'node',
-                        nodePath: (runtime as Record<string, unknown>).nodePath as string,
-                        entryPath: (runtime as Record<string, unknown>).entryPath as string,
-                    },
-                    claudeManagedCommand: record.claudeManagedCommand,
-                    detectedOtherClaudeStopHooksAtInstall: record.detectedOtherClaudeStopHooksAtInstall,
-                    wrapperVersion: 2,
-                    ...(codexOriginalNotify ? { codexOriginalNotify } : {}),
-                };
+            if (record.schemaVersion === 2) {
+                return readManifestV2(record);
             }
         } catch {
             return null;
@@ -270,7 +349,10 @@ export class HookInstaller {
 
     private async cleanupManagedScripts(): Promise<void> {
         await fs.rm(getClaudeHookWrapperPath(), { force: true });
+        await fs.rm(getClaudeNotificationHookWrapperPath(), { force: true });
         await fs.rm(getCodexHookWrapperPath(), { force: true });
+        await fs.rm(getCodexStopHookWrapperPath(), { force: true });
+        await fs.rm(getCodexPermissionHookWrapperPath(), { force: true });
         await fs.rm(getCodexLegacyNotifyPath(), { force: true });
         await fs.rm(getShimPath(), { force: true });
     }
@@ -364,9 +446,9 @@ process.exit(result.status ?? 1);
         await fs.chmod(getShimPath(), 0o755);
     }
 
-    private async writeCodexWrapper(): Promise<void> {
+    private async writeCodexNotifyWrapper(): Promise<void> {
         const script = `#!/bin/bash
-# agent-notifier-managed wrapper-version=${WRAPPER_VERSION} provider=codex
+# agent-notifier-managed wrapper-version=${WRAPPER_VERSION} provider=codex-notify
 set -u
 
 SHIM=${JSON.stringify(getShimPath())}
@@ -380,10 +462,10 @@ log_wrapper_failure() {
   local stderr="$3"
   mkdir -p "$(dirname "$LOG_PATH")"
   stderr="\${stderr//$'\\n'/\\\\n}"
-  printf '%s provider=codex wrapper-version=${WRAPPER_VERSION} stage=%s exit_code=%s stderr=%s\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$stage" "$exit_code" "$stderr" >> "$LOG_PATH"
+  printf '%s provider=codex-notify wrapper-version=${WRAPPER_VERSION} stage=%s exit_code=%s stderr=%s\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$stage" "$exit_code" "$stderr" >> "$LOG_PATH"
 }
 
-if ! output="$("$SHIM" hook codex "$PAYLOAD" 2>&1)"; then
+if ! output="$("$SHIM" hook codex-notify "$PAYLOAD" 2>&1)"; then
   code=$?
   log_wrapper_failure "shim" "$code" "$output"
 fi
@@ -399,6 +481,64 @@ exit 0
 `;
         await fs.writeFile(getCodexHookWrapperPath(), script, 'utf8');
         await fs.chmod(getCodexHookWrapperPath(), 0o755);
+    }
+
+    private async writeCodexStopWrapper(): Promise<void> {
+        const script = `#!/bin/bash
+# agent-notifier-managed wrapper-version=${WRAPPER_VERSION} provider=codex-stop
+set -u
+
+SHIM=${JSON.stringify(getShimPath())}
+LOG_PATH=${JSON.stringify(getHooksWrapperLogPath())}
+PAYLOAD="$(cat)"
+
+log_wrapper_failure() {
+  local stage="$1"
+  local exit_code="$2"
+  local stderr="$3"
+  mkdir -p "$(dirname "$LOG_PATH")"
+  stderr="\${stderr//$'\\n'/\\\\n}"
+  printf '%s provider=codex-stop wrapper-version=${WRAPPER_VERSION} stage=%s exit_code=%s stderr=%s\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$stage" "$exit_code" "$stderr" >> "$LOG_PATH"
+}
+
+if ! output="$(printf '%s' "$PAYLOAD" | "$SHIM" hook codex-stop 2>&1)"; then
+  code=$?
+  log_wrapper_failure "shim" "$code" "$output"
+fi
+
+exit 0
+`;
+        await fs.writeFile(getCodexStopHookWrapperPath(), script, 'utf8');
+        await fs.chmod(getCodexStopHookWrapperPath(), 0o755);
+    }
+
+    private async writeCodexPermissionWrapper(): Promise<void> {
+        const script = `#!/bin/bash
+# agent-notifier-managed wrapper-version=${WRAPPER_VERSION} provider=codex-permission-request
+set -u
+
+SHIM=${JSON.stringify(getShimPath())}
+LOG_PATH=${JSON.stringify(getHooksWrapperLogPath())}
+PAYLOAD="$(cat)"
+
+log_wrapper_failure() {
+  local stage="$1"
+  local exit_code="$2"
+  local stderr="$3"
+  mkdir -p "$(dirname "$LOG_PATH")"
+  stderr="\${stderr//$'\\n'/\\\\n}"
+  printf '%s provider=codex-permission-request wrapper-version=${WRAPPER_VERSION} stage=%s exit_code=%s stderr=%s\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$stage" "$exit_code" "$stderr" >> "$LOG_PATH"
+}
+
+if ! output="$(printf '%s' "$PAYLOAD" | "$SHIM" hook codex-permission-request 2>&1)"; then
+  code=$?
+  log_wrapper_failure "shim" "$code" "$output"
+fi
+
+exit 0
+`;
+        await fs.writeFile(getCodexPermissionHookWrapperPath(), script, 'utf8');
+        await fs.chmod(getCodexPermissionHookWrapperPath(), 0o755);
     }
 
     private async writeCodexLegacyWrapper(originalNotifyArgs?: string[]): Promise<void> {
@@ -419,9 +559,9 @@ ${command} "$PAYLOAD"
         await fs.chmod(getCodexLegacyNotifyPath(), 0o755);
     }
 
-    private async writeClaudeWrapper(): Promise<void> {
+    private async writeClaudeStopWrapper(): Promise<void> {
         const script = `#!/bin/bash
-# agent-notifier-managed wrapper-version=${WRAPPER_VERSION} provider=claude
+# agent-notifier-managed wrapper-version=${WRAPPER_VERSION} provider=claude-stop
 set -u
 
 SHIM=${JSON.stringify(getShimPath())}
@@ -434,10 +574,10 @@ log_wrapper_failure() {
   local stderr="$3"
   mkdir -p "$(dirname "$LOG_PATH")"
   stderr="\${stderr//$'\\n'/\\\\n}"
-  printf '%s provider=claude wrapper-version=${WRAPPER_VERSION} stage=%s exit_code=%s stderr=%s\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$stage" "$exit_code" "$stderr" >> "$LOG_PATH"
+  printf '%s provider=claude-stop wrapper-version=${WRAPPER_VERSION} stage=%s exit_code=%s stderr=%s\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$stage" "$exit_code" "$stderr" >> "$LOG_PATH"
 }
 
-if ! output="$(printf '%s' "$PAYLOAD" | "$SHIM" hook claude 2>&1)"; then
+if ! output="$(printf '%s' "$PAYLOAD" | "$SHIM" hook claude-stop 2>&1)"; then
   code=$?
   log_wrapper_failure "shim" "$code" "$output"
 fi
@@ -448,21 +588,69 @@ exit 0
         await fs.chmod(getClaudeHookWrapperPath(), 0o755);
     }
 
+    private async writeClaudeNotificationWrapper(): Promise<void> {
+        const script = `#!/bin/bash
+# agent-notifier-managed wrapper-version=${WRAPPER_VERSION} provider=claude-notification
+set -u
+
+SHIM=${JSON.stringify(getShimPath())}
+LOG_PATH=${JSON.stringify(getHooksWrapperLogPath())}
+PAYLOAD="$(cat)"
+
+log_wrapper_failure() {
+  local stage="$1"
+  local exit_code="$2"
+  local stderr="$3"
+  mkdir -p "$(dirname "$LOG_PATH")"
+  stderr="\${stderr//$'\\n'/\\\\n}"
+  printf '%s provider=claude-notification wrapper-version=${WRAPPER_VERSION} stage=%s exit_code=%s stderr=%s\\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$stage" "$exit_code" "$stderr" >> "$LOG_PATH"
+}
+
+if ! output="$(printf '%s' "$PAYLOAD" | "$SHIM" hook claude-notification 2>&1)"; then
+  code=$?
+  log_wrapper_failure "shim" "$code" "$output"
+fi
+
+exit 0
+`;
+        await fs.writeFile(getClaudeNotificationHookWrapperPath(), script, 'utf8');
+        await fs.chmod(getClaudeNotificationHookWrapperPath(), 0o755);
+    }
+
     private async hasStaleWrapperVersion(): Promise<boolean> {
-        const [codexHeader, claudeHeader] = await Promise.all([
-            readHeaderIfExists(getCodexHookWrapperPath()),
-            readHeaderIfExists(getClaudeHookWrapperPath()),
+        const expectedHeaders = new Map<string, string>([
+            [getCodexHookWrapperPath(), `# agent-notifier-managed wrapper-version=${WRAPPER_VERSION} provider=codex-notify`],
+            [getCodexStopHookWrapperPath(), `# agent-notifier-managed wrapper-version=${WRAPPER_VERSION} provider=codex-stop`],
+            [getCodexPermissionHookWrapperPath(), `# agent-notifier-managed wrapper-version=${WRAPPER_VERSION} provider=codex-permission-request`],
+            [getClaudeHookWrapperPath(), `# agent-notifier-managed wrapper-version=${WRAPPER_VERSION} provider=claude-stop`],
+            [getClaudeNotificationHookWrapperPath(), `# agent-notifier-managed wrapper-version=${WRAPPER_VERSION} provider=claude-notification`],
         ]);
 
-        return !isManagedWrapperHeader(codexHeader, 'codex') || !isManagedWrapperHeader(claudeHeader, 'claude');
+        const headers = await Promise.all(
+            [...expectedHeaders.keys()].map(async filePath => [filePath, await readHeaderIfExists(filePath)] as const),
+        );
+
+        return headers.some(([filePath, header]) => header !== expectedHeaders.get(filePath));
     }
 
     private getManagedCodexNotifyArgs(): string[] {
         return [BASH_PATH, getCodexHookWrapperPath()];
     }
 
-    private getClaudeHookCommand(): string {
+    private getCodexStopHookCommand(): string {
+        return shellJoinArgs([BASH_PATH, getCodexStopHookWrapperPath()]);
+    }
+
+    private getCodexPermissionHookCommand(): string {
+        return shellJoinArgs([BASH_PATH, getCodexPermissionHookWrapperPath()]);
+    }
+
+    private getClaudeStopHookCommand(): string {
         return shellJoinArgs([BASH_PATH, getClaudeHookWrapperPath()]);
+    }
+
+    private getClaudeNotificationHookCommand(): string {
+        return shellJoinArgs([BASH_PATH, getClaudeNotificationHookWrapperPath()]);
     }
 
     private async loadLegacyState(): Promise<HookInstallState> {
@@ -486,6 +674,103 @@ exit 0
     }
 }
 
+function readManifestV3(record: Record<string, unknown>): InstallManifest | null {
+    const runtime = readRuntime(record.runtime);
+    const codexOriginalNotify = readStringArray(record.codexOriginalNotify);
+    const codexHooksFeatureStateBeforeInstall = readCodexHooksFeatureState(record.codexHooksFeatureStateBeforeInstall);
+    const codexStopCommand = readOptionalString(record.codexStopCommand);
+    const codexPermissionCommand = readOptionalString(record.codexPermissionCommand);
+    const claudePermissionPromptCommand = readOptionalString(record.claudePermissionPromptCommand);
+
+    if (
+        !runtime
+        || (record.codexRuntimeMode !== 'hooks-first' && record.codexRuntimeMode !== 'notify-fallback' && record.codexRuntimeMode !== 'hybrid')
+        || typeof record.installedAt !== 'string'
+        || typeof record.shimPath !== 'string'
+        || typeof record.claudeStopCommand !== 'string'
+        || typeof record.detectedOtherClaudeStopHooksAtInstall !== 'number'
+        || typeof record.detectedOtherClaudePermissionPromptHooksAtInstall !== 'number'
+        || typeof record.wrapperVersion !== 'number'
+    ) {
+        return null;
+    }
+
+    return {
+        schemaVersion: 3,
+        installedAt: record.installedAt,
+        codexRuntimeMode: record.codexRuntimeMode,
+        shimPath: record.shimPath,
+        runtime,
+        claudeStopCommand: record.claudeStopCommand,
+        detectedOtherClaudeStopHooksAtInstall: record.detectedOtherClaudeStopHooksAtInstall,
+        detectedOtherClaudePermissionPromptHooksAtInstall: record.detectedOtherClaudePermissionPromptHooksAtInstall,
+        wrapperVersion: record.wrapperVersion,
+        ...(codexOriginalNotify ? { codexOriginalNotify } : {}),
+        ...(codexHooksFeatureStateBeforeInstall ? { codexHooksFeatureStateBeforeInstall } : {}),
+        ...(codexStopCommand ? { codexStopCommand } : {}),
+        ...(codexPermissionCommand ? { codexPermissionCommand } : {}),
+        ...(claudePermissionPromptCommand ? { claudePermissionPromptCommand } : {}),
+    };
+}
+
+function readManifestV2(record: Record<string, unknown>): InstallManifest | null {
+    const runtime = readRuntime(record.runtime);
+    const codexOriginalNotify = readStringArray(record.codexOriginalNotify);
+
+    if (
+        !runtime
+        || (record.codexManagedMode !== 'chain-existing' && record.codexManagedMode !== 'exclusive-managed')
+        || typeof record.installedAt !== 'string'
+        || typeof record.shimPath !== 'string'
+        || typeof record.claudeManagedCommand !== 'string'
+        || typeof record.detectedOtherClaudeStopHooksAtInstall !== 'number'
+        || typeof record.wrapperVersion !== 'number'
+    ) {
+        return null;
+    }
+
+    return {
+        schemaVersion: 3,
+        installedAt: record.installedAt,
+        codexRuntimeMode: 'notify-fallback',
+        shimPath: record.shimPath,
+        runtime,
+        claudeStopCommand: record.claudeManagedCommand,
+        detectedOtherClaudeStopHooksAtInstall: record.detectedOtherClaudeStopHooksAtInstall,
+        detectedOtherClaudePermissionPromptHooksAtInstall: 0,
+        wrapperVersion: record.wrapperVersion,
+        ...(codexOriginalNotify ? { codexOriginalNotify } : {}),
+    };
+}
+
+function readRuntime(value: unknown): InstallManifest['runtime'] | null {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return null;
+    }
+
+    const runtime = value as Record<string, unknown>;
+    if (runtime.kind === 'binary' && typeof runtime.command === 'string') {
+        return {
+            kind: 'binary',
+            command: runtime.command,
+        };
+    }
+
+    if (
+        runtime.kind === 'node'
+        && typeof runtime.nodePath === 'string'
+        && typeof runtime.entryPath === 'string'
+    ) {
+        return {
+            kind: 'node',
+            nodePath: runtime.nodePath,
+            entryPath: runtime.entryPath,
+        };
+    }
+
+    return null;
+}
+
 function arraysEqual(left: string[] | null | undefined, right: string[] | null | undefined): boolean {
     if (!left || !right || left.length !== right.length) {
         return false;
@@ -500,8 +785,18 @@ function readStringArray(value: unknown): string[] | undefined {
         : undefined;
 }
 
-function isManagedWrapperHeader(line: string | null, provider: 'codex' | 'claude'): boolean {
-    return line === `# agent-notifier-managed wrapper-version=${WRAPPER_VERSION} provider=${provider}`;
+function readOptionalString(value: unknown): string | undefined {
+    return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function readCodexHooksFeatureState(value: unknown): 'enabled' | 'disabled' | 'missing' | undefined {
+    return value === 'enabled' || value === 'disabled' || value === 'missing'
+        ? value
+        : undefined;
+}
+
+function hasConfiguredCodexHooks(settings: { hooks?: Record<string, unknown> }): boolean {
+    return Object.keys(settings.hooks ?? {}).length > 0;
 }
 
 async function readFileIfExists(filePath: string): Promise<string | null> {
@@ -518,5 +813,5 @@ async function readHeaderIfExists(filePath: string): Promise<string | null> {
         return null;
     }
     const lines = content.split('\n');
-    return lines.find(line => line.startsWith('# agent-notifier-managed')) ?? null;
+    return lines[1] ?? null;
 }

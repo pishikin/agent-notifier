@@ -2,12 +2,12 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { HookStatus } from '../../src/types.js';
+import type { EventMarker, HookStatus } from '../../src/types.js';
 
 let tmpHome = '';
 let hookStatus: HookStatus;
 let legacyDaemonRunning = false;
-let recentMarkers: Array<Record<string, unknown>> = [];
+let recentMarkers: EventMarker[] = [];
 
 vi.mock('../../src/utils/paths.js', () => ({
     getActivePath: () => path.join(tmpHome, '.agent-notifier', 'active-sessions.json'),
@@ -67,9 +67,15 @@ describe('statusCommand', () => {
         tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-notifier-status-'));
         await fs.mkdir(path.join(tmpHome, '.agent-notifier'), { recursive: true });
         hookStatus = {
-            codexConfigured: true,
-            claudeConfigured: true,
+            codexCompletionConfigured: true,
+            codexApprovalConfigured: true,
+            claudeCompletionConfigured: true,
+            claudeApprovalConfigured: true,
+            codexRuntimeMode: 'hooks-first',
+            codexHooksFeatureEnabled: true,
+            externalCodexNotifyConfigured: false,
             otherClaudeStopHooks: 0,
+            otherClaudePermissionPromptHooks: 0,
             manifestPresent: true,
             staleWrapperVersionDetected: false,
         };
@@ -83,15 +89,23 @@ describe('statusCommand', () => {
         vi.resetModules();
     });
 
-    it('prints recent marker-based events', async () => {
+    it('prints recent marker-based attention events', async () => {
         recentMarkers = [
             {
+                schemaVersion: 3,
                 eventId: 'evt-1',
+                eventIdHash: 'hash',
+                source: 'codex-stop',
                 agentType: 'codex',
+                kind: 'turn-complete',
+                workspacePath: '/tmp/project',
                 projectName: 'project',
                 gitBranch: 'main',
-                outcome: 'completed',
-                completedAt: '2026-04-17T00:00:00.000Z',
+                windowId: 'win',
+                occurredAt: '2026-04-17T00:00:00.000Z',
+                processingState: 'backend-accepted',
+                reservedAt: '2026-04-17T00:00:00.000Z',
+                updatedAt: '2026-04-17T00:00:01.000Z',
                 finalizedAt: '2026-04-17T00:00:01.000Z',
             },
         ];
@@ -101,19 +115,22 @@ describe('statusCommand', () => {
         await statusCommand();
 
         const output = consoleSpy.mock.calls.flat().join('\n');
-        expect(output).toContain('Mode: hook-first');
-        expect(output).toContain('Recent completed turns');
+        expect(output).toContain('Mode: hooks-first');
+        expect(output).toContain('Codex runtime mode: hooks-first');
+        expect(output).toContain('Recent attention events');
         expect(output).toContain('codex project · main');
     });
 
-    it('falls back to install and doctor guidance when health is degraded', async () => {
+    it('shows install and doctor guidance when health is degraded', async () => {
         hookStatus = {
-            codexConfigured: false,
-            claudeConfigured: true,
+            ...hookStatus,
+            codexCompletionConfigured: false,
+            codexApprovalConfigured: false,
+            externalCodexNotifyConfigured: true,
             otherClaudeStopHooks: 2,
-            manifestPresent: true,
+            otherClaudePermissionPromptHooks: 1,
             staleWrapperVersionDetected: true,
-            codexManagedMode: 'chain-existing',
+            codexRuntimeMode: 'hybrid',
         };
 
         const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
@@ -121,6 +138,9 @@ describe('statusCommand', () => {
         await statusCommand();
 
         const output = consoleSpy.mock.calls.flat().join('\n');
+        expect(output).toContain('Mode: hybrid');
+        expect(output).toContain('Codex runtime mode: hybrid');
+        expect(output).toContain('Codex external notify: ● present');
         expect(output).toContain('Run `agent-notifier install`');
         expect(output).toContain('Run `agent-notifier doctor`');
     });

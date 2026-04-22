@@ -35,10 +35,19 @@ export type AgentType = 'claude' | 'codex';
 export type SessionState = 'running' | 'completed' | 'notified';
 export type HookSource =
     | 'codex-notify'
+    | 'codex-stop'
+    | 'codex-permission-request'
     | 'claude-stop'
     | 'claude-stop-failure'
+    | 'claude-notification'
     | 'legacy-process-exit';
 export type TurnOutcome = 'completed' | 'failed';
+export type AttentionEventKind = 'turn-complete' | 'turn-failed' | 'approval-request';
+export type ClaudeNotificationType =
+    | 'permission_prompt'
+    | 'idle_prompt'
+    | 'auth_success'
+    | 'elicitation_dialog';
 
 export interface NotificationTarget {
     readonly agentType: AgentType;
@@ -49,16 +58,22 @@ export interface NotificationTarget {
 }
 
 export interface ProviderEventDetails {
-    readonly hookEventName?: 'Stop' | 'StopFailure';
+    readonly hookEventName?: 'Stop' | 'StopFailure' | 'PermissionRequest' | 'Notification';
     readonly codexTurnId?: string;
     readonly codexThreadId?: string;
-    readonly claudeStopHookActive?: boolean;
+    readonly stopHookActive?: boolean;
     readonly transcriptPath?: string;
     readonly transcriptStat?: {
         readonly size: number;
         readonly mtimeMs: number;
     };
     readonly failureType?: string;
+    readonly toolName?: string;
+    readonly toolCommand?: string;
+    readonly toolDescription?: string;
+    readonly notificationType?: ClaudeNotificationType;
+    readonly notificationTitle?: string;
+    readonly notificationMessage?: string;
 }
 
 /**
@@ -86,7 +101,17 @@ export interface AgentSession extends NotificationTarget {
     readonly windowId: string;
 }
 
-export interface AgentTurnEvent extends NotificationTarget {
+export interface AgentAttentionEvent extends NotificationTarget {
+    readonly eventId: string;
+    readonly source: HookSource;
+    readonly kind: AttentionEventKind;
+    readonly providerSessionId?: string;
+    readonly summary?: string;
+    readonly occurredAt: string;
+    readonly providerEvent?: ProviderEventDetails;
+}
+
+export interface TurnCompletionEvent extends NotificationTarget {
     readonly eventId: string;
     readonly source: HookSource;
     readonly outcome: TurnOutcome;
@@ -97,17 +122,15 @@ export interface AgentTurnEvent extends NotificationTarget {
     readonly providerEvent?: ProviderEventDetails;
 }
 
-export type TurnCompletionEvent = AgentTurnEvent;
-
 export interface HookEventCandidate {
     readonly agentType: AgentType;
     readonly source: HookSource;
+    readonly kind: AttentionEventKind;
     readonly dedupeKeyHint: string;
     readonly workspacePath: string;
     readonly providerSessionId?: string;
     readonly summary?: string;
     readonly transcriptPath?: string;
-    readonly outcome?: TurnOutcome;
     readonly providerEvent?: ProviderEventDetails;
 }
 
@@ -137,19 +160,19 @@ export type EventProcessingState =
     | 'backend-failed';
 
 export interface EventMarker {
-    readonly schemaVersion: 2;
+    readonly schemaVersion: 3;
     readonly eventId: string;
     readonly eventIdHash: string;
     readonly source: HookSource;
     readonly agentType: AgentType;
-    readonly outcome: TurnOutcome;
+    readonly kind: AttentionEventKind;
     readonly workspacePath: string;
     readonly projectName: string;
     readonly gitBranch?: string;
     readonly windowId: string;
     readonly providerSessionId?: string;
     readonly summary?: string;
-    readonly completedAt: string;
+    readonly occurredAt: string;
     readonly providerEvent?: ProviderEventDetails;
     readonly processingState: EventProcessingState;
     readonly reservedAt: string;
@@ -176,24 +199,34 @@ export interface HookInstallState {
 }
 
 export interface InstallManifest {
-    readonly schemaVersion: 2;
+    readonly schemaVersion: 3;
     readonly installedAt: string;
     readonly codexOriginalNotify?: string[];
-    readonly codexManagedMode: 'chain-existing' | 'exclusive-managed';
+    readonly codexRuntimeMode: 'hooks-first' | 'notify-fallback' | 'hybrid';
+    readonly codexHooksFeatureStateBeforeInstall?: 'enabled' | 'disabled' | 'missing';
     readonly shimPath: string;
     readonly runtime:
         | { readonly kind: 'binary'; readonly command: string }
         | { readonly kind: 'node'; readonly nodePath: string; readonly entryPath: string };
-    readonly claudeManagedCommand: string;
+    readonly codexStopCommand?: string;
+    readonly codexPermissionCommand?: string;
+    readonly claudeStopCommand: string;
+    readonly claudePermissionPromptCommand?: string;
     readonly detectedOtherClaudeStopHooksAtInstall: number;
-    readonly wrapperVersion: 2;
+    readonly detectedOtherClaudePermissionPromptHooksAtInstall: number;
+    readonly wrapperVersion: number;
 }
 
 export interface HookStatus {
-    readonly codexConfigured: boolean;
-    readonly claudeConfigured: boolean;
-    readonly codexManagedMode?: 'chain-existing' | 'exclusive-managed';
+    readonly codexCompletionConfigured: boolean;
+    readonly codexApprovalConfigured: boolean;
+    readonly claudeCompletionConfigured: boolean;
+    readonly claudeApprovalConfigured: boolean;
+    readonly codexRuntimeMode?: 'hooks-first' | 'notify-fallback' | 'hybrid';
+    readonly codexHooksFeatureEnabled: boolean;
+    readonly externalCodexNotifyConfigured: boolean;
     readonly otherClaudeStopHooks: number;
+    readonly otherClaudePermissionPromptHooks: number;
     readonly manifestPresent: boolean;
     readonly staleWrapperVersionDetected: boolean;
 }
@@ -201,7 +234,7 @@ export interface HookStatus {
 // --- Service interfaces (DI contracts) ---
 
 export interface INotificationService {
-    send(target: AgentTurnEvent): Promise<NotificationSendResult>;
+    send(target: AgentAttentionEvent): Promise<NotificationSendResult>;
 }
 
 export interface ISessionRegistry {

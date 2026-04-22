@@ -9,8 +9,11 @@ import type { ILogger } from '../types.js';
 import {
     getBinDir,
     getClaudeHookWrapperPath,
+    getClaudeNotificationHookWrapperPath,
     getConfigDir,
-    getCodexHookWrapperPath,
+    getCodexHooksPath,
+    getCodexPermissionHookWrapperPath,
+    getCodexStopHookWrapperPath,
     getEventMarkersDir,
     getFocusScriptPath,
     getHooksDir,
@@ -110,8 +113,10 @@ async function buildArtifactsSection(manifestPresent: boolean): Promise<DoctorSe
         checkExists(getHooksDir(), true, 'Hooks dir exists'),
         checkExists(getBinDir(), true, 'Bin dir exists'),
         checkExecutable(getShimPath(), 'Shim exists and is executable'),
-        checkExecutable(getCodexHookWrapperPath(), 'Codex wrapper exists and is executable'),
-        checkExecutable(getClaudeHookWrapperPath(), 'Claude wrapper exists and is executable'),
+        checkExecutable(getCodexStopHookWrapperPath(), 'Codex Stop wrapper exists and is executable'),
+        checkExecutable(getCodexPermissionHookWrapperPath(), 'Codex PermissionRequest wrapper exists and is executable'),
+        checkExecutable(getClaudeHookWrapperPath(), 'Claude Stop wrapper exists and is executable'),
+        checkExecutable(getClaudeNotificationHookWrapperPath(), 'Claude permission_prompt Notification wrapper exists and is executable'),
         checkExists(getInstallManifestPath(), false, 'Install manifest exists'),
     ]);
 
@@ -160,6 +165,7 @@ async function buildRuntimeSection(
     });
 
     lines.push(await checkExecutable(getFocusScriptPath(), 'Focus script exists and is executable'));
+    lines.push(await checkExists(getCodexHooksPath(), false, 'Codex hooks.json exists'));
 
     return {
         title: 'Section 2 — runtime target health',
@@ -172,22 +178,34 @@ async function buildProviderSection(status: Awaited<ReturnType<HookInstaller['ge
         title: 'Section 3 — provider configuration health',
         lines: [
             {
-                level: status.codexConfigured ? 'ok' : 'error',
-                text: status.codexConfigured
-                    ? 'Codex notify points to the managed wrapper.'
-                    : 'Codex notify is missing, custom, or unsupported.',
+                level: status.codexCompletionConfigured ? 'ok' : 'error',
+                text: status.codexCompletionConfigured
+                    ? 'Codex completion path is configured.'
+                    : 'Codex completion path is missing.',
             },
             {
-                level: status.claudeConfigured ? 'ok' : 'error',
-                text: status.claudeConfigured
+                level: status.codexApprovalConfigured ? 'ok' : 'error',
+                text: status.codexApprovalConfigured
+                    ? 'Codex approval path is configured.'
+                    : 'Codex approval path is missing.',
+            },
+            {
+                level: status.claudeCompletionConfigured ? 'ok' : 'error',
+                text: status.claudeCompletionConfigured
                     ? 'Claude managed Stop hook is installed.'
                     : 'Claude managed Stop hook is missing.',
             },
             {
-                level: status.otherClaudeStopHooks > 0 ? 'warn' : 'ok',
-                text: status.otherClaudeStopHooks > 0
-                    ? `Detected ${status.otherClaudeStopHooks} other Claude Stop hook(s).`
-                    : 'No other Claude Stop hooks detected.',
+                level: status.claudeApprovalConfigured ? 'ok' : 'error',
+                text: status.claudeApprovalConfigured
+                    ? 'Claude managed permission_prompt Notification hook is installed.'
+                    : 'Claude managed permission_prompt Notification hook is missing.',
+            },
+            {
+                level: status.codexHooksFeatureEnabled ? 'ok' : 'warn',
+                text: status.codexHooksFeatureEnabled
+                    ? 'Codex hooks feature flag is enabled.'
+                    : 'Codex hooks feature flag is disabled.',
             },
         ],
     };
@@ -202,13 +220,31 @@ function buildSemanticRiskSection(
     if (status.otherClaudeStopHooks > 0) {
         lines.push({
             level: 'warn',
-            text: 'Claude completion semantics are degraded because multiple Stop hooks can run in parallel.',
+            text: `Detected ${status.otherClaudeStopHooks} other Claude Stop hook(s).`,
         });
     }
-    if (status.codexManagedMode === 'chain-existing') {
+    if (status.otherClaudePermissionPromptHooks > 0) {
         lines.push({
             level: 'warn',
-            text: 'Codex is installed in chain-existing mode; duplicate desktop notifications are possible.',
+            text: `Detected ${status.otherClaudePermissionPromptHooks} other Claude permission_prompt Notification hook(s).`,
+        });
+    }
+    if (status.externalCodexNotifyConfigured) {
+        lines.push({
+            level: 'warn',
+            text: 'Codex has an external notify command configured; duplicate desktop notifications are possible.',
+        });
+    }
+    if (status.codexRuntimeMode === 'notify-fallback') {
+        lines.push({
+            level: 'warn',
+            text: 'Codex is still running in legacy notify-fallback mode.',
+        });
+    }
+    if (status.codexRuntimeMode === 'hybrid') {
+        lines.push({
+            level: 'warn',
+            text: 'Codex is in hybrid mode; hooks-first and notify-fallback are both active.',
         });
     }
     if (status.staleWrapperVersionDetected) {
@@ -244,11 +280,11 @@ async function buildLedgerSection(ledger: EventLedger): Promise<DoctorSection> {
             await checkExists(getEventMarkersDir(), true, 'Marker directory exists'),
             { level: 'info', text: `Finalized markers: ${stats.finalizedCount}` },
             { level: stats.reservedCount > 0 ? 'warn' : 'ok', text: `Reserved/inflight markers: ${stats.reservedCount}` },
-            { level: stats.backupCount > 0 ? 'warn' : 'ok', text: `Stale/corrupt backups: ${stats.backupCount}` },
+            { level: stats.backupCount > 0 ? 'warn' : 'ok', text: `Backup markers: ${stats.backupCount}` },
             {
                 level: stats.lastFinalized ? 'info' : 'warn',
                 text: stats.lastFinalized
-                    ? `Last finalized event: ${stats.lastFinalized.agentType} ${stats.lastFinalized.projectName} (${stats.lastFinalized.processingState})`
+                    ? `Last finalized event: ${stats.lastFinalized.agentType} ${stats.lastFinalized.projectName} (${stats.lastFinalized.kind}, ${stats.lastFinalized.processingState})`
                     : 'No finalized markers yet.',
             },
         ],
@@ -324,8 +360,8 @@ function symbolForLevel(level: DoctorLine['level']): string {
         case 'warn':
             return '!';
         case 'error':
-            return 'x';
+            return '✗';
         case 'info':
-            return '-';
+            return 'i';
     }
 }

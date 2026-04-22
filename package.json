@@ -1,7 +1,7 @@
 {
     "name": "agent-notifier",
     "version": "1.0.0",
-    "description": "macOS hook-first notifier for Claude and Codex turn completions inside Cursor",
+    "description": "macOS hook-first notifier for Claude and Codex turn completions and approval requests inside Cursor",
     "type": "module",
     "bin": {
         "agent-notifier": "./dist/index.js"

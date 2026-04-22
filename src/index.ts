@@ -11,7 +11,7 @@ import { doctorCommand } from './commands/doctor.js';
 program
     .name('agent-notifier')
     .version('1.0.0')
-    .description('macOS notifier for Codex/Claude terminal completions inside Cursor');
+    .description('macOS notifier for Codex/Claude terminal completions and approvals inside Cursor');
 
 program
     .command('install')
@@ -25,7 +25,7 @@ program
 
 program
     .command('status')
-    .description('Show hook status and recent completions')
+    .description('Show hook status and recent attention events')
     .action(() => void statusCommand());
 
 program
