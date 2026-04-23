@@ -6,7 +6,7 @@ import type { EventMarker, HookStatus } from '../../src/types.js';
 
 let tmpHome = '';
 let hookStatus: HookStatus;
-let legacyDaemonRunning = false;
+let backgroundMonitorRunning = false;
 let recentMarkers: EventMarker[] = [];
 
 vi.mock('../../src/utils/paths.js', () => ({
@@ -41,7 +41,7 @@ vi.mock('../../src/infra/HookInstaller.js', () => ({
 vi.mock('../../src/infra/LaunchAgent.js', () => ({
     LaunchAgent: class {
         async isRunning() {
-            return legacyDaemonRunning;
+            return backgroundMonitorRunning;
         }
     },
 }));
@@ -79,7 +79,7 @@ describe('statusCommand', () => {
             manifestPresent: true,
             staleWrapperVersionDetected: false,
         };
-        legacyDaemonRunning = false;
+        backgroundMonitorRunning = true;
         recentMarkers = [];
     });
 
@@ -116,6 +116,7 @@ describe('statusCommand', () => {
 
         const output = consoleSpy.mock.calls.flat().join('\n');
         expect(output).toContain('Mode: hooks-first');
+        expect(output).toContain('Background monitor: ● running');
         expect(output).toContain('Codex runtime mode: hooks-first');
         expect(output).toContain('Recent attention events');
         expect(output).toContain('codex project · main');
@@ -141,6 +142,7 @@ describe('statusCommand', () => {
         expect(output).toContain('Mode: hybrid');
         expect(output).toContain('Codex runtime mode: hybrid');
         expect(output).toContain('Codex external notify: ● present');
+        expect(output).toContain('Background monitor: ● running');
         expect(output).toContain('Run `agent-notifier install`');
         expect(output).toContain('Run `agent-notifier doctor`');
     });

@@ -118,6 +118,10 @@ export function getCodexHooksPath(): string {
     return path.join(os.homedir(), '.codex', 'hooks.json');
 }
 
+export function getCodexTuiLogPath(): string {
+    return path.join(os.homedir(), '.codex', 'log', 'codex-tui.log');
+}
+
 export function getClaudeSettingsPath(): string {
     return path.join(os.homedir(), '.claude', 'settings.json');
 }

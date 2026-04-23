@@ -9,7 +9,7 @@ export async function uninstallCommand(): Promise<void> {
 
     console.log('Removing managed Codex/Claude hooks...');
     const uninstallResult = await hookInstaller.uninstall();
-    console.log('Stopping and removing legacy LaunchAgent...');
+    console.log('Stopping and removing background monitor...');
     await launchAgent.uninstall().catch(() => undefined);
     console.log('✓ Agent Notifier uninstalled.');
     console.log(`  Codex notify ${uninstallResult.restoredCodexNotify ? 'was restored from the install manifest.' : 'was left untouched because managed state was not detected.'}`);

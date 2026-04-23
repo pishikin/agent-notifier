@@ -37,6 +37,7 @@ export type HookSource =
     | 'codex-notify'
     | 'codex-stop'
     | 'codex-permission-request'
+    | 'codex-log-exec-approval'
     | 'claude-stop'
     | 'claude-stop-failure'
     | 'claude-notification'

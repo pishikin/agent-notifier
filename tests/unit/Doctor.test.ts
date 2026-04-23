@@ -7,7 +7,7 @@ import type { EventMarker, HookStatus, InstallManifest } from '../../src/types.j
 let tmpHome = '';
 let manifest: InstallManifest | null = null;
 let hookStatus: HookStatus;
-let legacyDaemonRunning = false;
+let backgroundMonitorRunning = false;
 let ledgerStats: {
     finalizedCount: number;
     reservedCount: number;
@@ -77,7 +77,7 @@ vi.mock('../../src/infra/HookInstaller.js', () => ({
 vi.mock('../../src/infra/LaunchAgent.js', () => ({
     LaunchAgent: class {
         async isRunning() {
-            return legacyDaemonRunning;
+            return backgroundMonitorRunning;
         }
     },
 }));
@@ -154,7 +154,7 @@ describe('buildDoctorReport', () => {
             manifestPresent: true,
             staleWrapperVersionDetected: false,
         };
-        legacyDaemonRunning = false;
+        backgroundMonitorRunning = true;
         ledgerStats = {
             finalizedCount: 5,
             reservedCount: 0,
@@ -199,6 +199,7 @@ describe('buildDoctorReport', () => {
         expect(report.hasCriticalFailures).toBe(false);
         expect(report.sections[1]?.lines.some(line => line.text.includes('Shim resolves a live agent-notifier runtime.'))).toBe(true);
         expect(report.sections[1]?.lines.some(line => line.text.includes('Codex hooks.json exists'))).toBe(true);
+        expect(report.sections[1]?.lines.some(line => line.text.includes('Background monitor is running.'))).toBe(true);
         expect(report.sections[2]?.lines.some(line => line.text.includes('Codex approval path is configured.'))).toBe(true);
         expect(report.sections[4]?.lines.some(line => line.text.includes('Finalized markers: 5'))).toBe(true);
         expect(report.sections[4]?.lines.some(line => line.text.includes('Last finalized event: codex project (turn-complete, backend-accepted)'))).toBe(true);
@@ -224,7 +225,7 @@ describe('buildDoctorReport', () => {
             codexRuntimeMode: 'hybrid',
             staleWrapperVersionDetected: true,
         };
-        legacyDaemonRunning = true;
+        backgroundMonitorRunning = false;
 
         const { buildDoctorReport } = await import('../../src/commands/doctor.js');
         const report = await buildDoctorReport();
@@ -232,8 +233,9 @@ describe('buildDoctorReport', () => {
         expect(report.hasCriticalFailures).toBe(true);
         expect(report.sections[1]?.lines.some(line => line.text.includes('Shim could not resolve'))).toBe(true);
         expect(report.sections[1]?.lines.some(line => line.text.includes('terminal-notifier is missing'))).toBe(true);
+        expect(report.sections[1]?.lines.some(line => line.text.includes('Background monitor is not running.'))).toBe(true);
         expect(report.sections[2]?.lines.some(line => line.text.includes('Codex approval path is missing.'))).toBe(true);
         expect(report.sections[3]?.lines.some(line => line.text.includes('hybrid mode'))).toBe(true);
-        expect(report.sections[3]?.lines.some(line => line.text.includes('Legacy daemon is still running'))).toBe(true);
+        expect(report.sections[3]?.lines.some(line => line.text.includes('Background monitor is stopped'))).toBe(true);
     });
 });

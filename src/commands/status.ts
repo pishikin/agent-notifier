@@ -5,8 +5,8 @@ import { HookInstaller } from '../infra/HookInstaller.js';
 import { LaunchAgent } from '../infra/LaunchAgent.js';
 import { EventLedger } from '../core/EventLedger.js';
 import { formatTimeAgo } from '../utils/process.js';
-import { getActivePath, getHistoryPath } from '../utils/paths.js';
-import type { AgentSession, EventMarker, ILogger, TurnCompletionEvent } from '../types.js';
+import { getHistoryPath } from '../utils/paths.js';
+import type { EventMarker, ILogger, TurnCompletionEvent } from '../types.js';
 
 function readJsonFile<T>(filePath: string): T | null {
     try {
@@ -31,34 +31,24 @@ export async function statusCommand(): Promise<void> {
     const config = loadConfig();
     const ledger = new EventLedger(config, silentLogger);
 
-    const [hookStatus, isLegacyDaemonRunning, recentMarkers] = await Promise.all([
+    const [hookStatus, isBackgroundMonitorRunning, recentMarkers] = await Promise.all([
         hookInstaller.getStatus(),
         launchAgent.isRunning(),
         ledger.listRecent(10),
     ]);
 
-    console.log(`Mode: ${deriveRuntimeMode(hookStatus, isLegacyDaemonRunning)}`);
+    console.log(`Mode: ${deriveRuntimeMode(hookStatus, isBackgroundMonitorRunning)}`);
     console.log(`Codex completion hook: ${hookStatus.codexCompletionConfigured ? '● configured' : '○ not configured'}`);
     console.log(`Codex approval hook: ${hookStatus.codexApprovalConfigured ? '● configured' : '○ not configured'}`);
     console.log(`Claude completion hook: ${hookStatus.claudeCompletionConfigured ? '● configured' : '○ not configured'}`);
     console.log(`Claude approval hook: ${hookStatus.claudeApprovalConfigured ? '● configured' : '○ not configured'}`);
-    console.log(`Legacy daemon: ${isLegacyDaemonRunning ? '● running (legacy)' : '○ stopped (legacy)'}`);
+    console.log(`Background monitor: ${isBackgroundMonitorRunning ? '● running' : '○ stopped'}`);
 
     if (hookStatus.codexRuntimeMode) {
         console.log(`Codex runtime mode: ${hookStatus.codexRuntimeMode}`);
     }
     if (hookStatus.externalCodexNotifyConfigured) {
         console.log('Codex external notify: ● present');
-    }
-
-    const active = readJsonFile<AgentSession[]>(getActivePath()) ?? [];
-    if (isLegacyDaemonRunning && active.length > 0) {
-        console.log(`\nLegacy active sessions: ${active.length}`);
-        for (const session of active) {
-            const durationSec = Math.round((Date.now() - new Date(session.discoveredAt).getTime()) / 1000);
-            const branchLabel = session.gitBranch ? ` (${session.gitBranch})` : '';
-            console.log(`  ${session.agentType} [${session.pid}] ${session.projectName}${branchLabel} — ${durationSec}s`);
-        }
     }
 
     if (recentMarkers.length > 0) {
@@ -75,7 +65,7 @@ export async function statusCommand(): Promise<void> {
                 const branchLabel = event.gitBranch ? ` · ${event.gitBranch}` : '';
                 console.log(`  ${event.agentType} ${event.projectName}${branchLabel} — ${ago}`);
             }
-        } else if (hasConfiguredHooks(hookStatus) || isLegacyDaemonRunning) {
+        } else if (hasConfiguredHooks(hookStatus) || isBackgroundMonitorRunning) {
             console.log('\nNo attention events yet');
         }
     }
@@ -89,7 +79,7 @@ export async function statusCommand(): Promise<void> {
         || hookStatus.otherClaudePermissionPromptHooks > 0
         || hookStatus.externalCodexNotifyConfigured
         || hookStatus.staleWrapperVersionDetected
-        || isLegacyDaemonRunning
+        || !isBackgroundMonitorRunning
     ) {
         console.log('\nRun `agent-notifier doctor` for deeper health diagnostics.');
     }
@@ -104,15 +94,15 @@ function hasConfiguredHooks(hookStatus: Awaited<ReturnType<HookInstaller['getSta
 
 function deriveRuntimeMode(
     hookStatus: Awaited<ReturnType<HookInstaller['getStatus']>>,
-    isLegacyDaemonRunning: boolean,
+    isBackgroundMonitorRunning: boolean,
 ): 'hooks-first' | 'hybrid' | 'notify-fallback' | 'degraded' {
     if (hookStatus.codexRuntimeMode === 'hybrid') {
-        return 'hybrid';
+        return isBackgroundMonitorRunning ? 'hybrid' : 'degraded';
     }
     if (hookStatus.codexRuntimeMode === 'notify-fallback') {
-        return 'notify-fallback';
+        return isBackgroundMonitorRunning ? 'notify-fallback' : 'degraded';
     }
-    if (hookStatus.codexRuntimeMode === 'hooks-first' && hasConfiguredHooks(hookStatus) && !isLegacyDaemonRunning) {
+    if (hookStatus.codexRuntimeMode === 'hooks-first' && hasConfiguredHooks(hookStatus) && isBackgroundMonitorRunning) {
         return 'hooks-first';
     }
     return 'degraded';

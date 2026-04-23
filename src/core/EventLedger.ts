@@ -584,6 +584,7 @@ function readHookSource(value: unknown): EventMarker['source'] | null {
         value === 'codex-notify'
         || value === 'codex-stop'
         || value === 'codex-permission-request'
+        || value === 'codex-log-exec-approval'
         || value === 'claude-stop'
         || value === 'claude-stop-failure'
         || value === 'claude-notification'

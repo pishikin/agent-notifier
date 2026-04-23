@@ -20,7 +20,7 @@ program
 
 program
     .command('uninstall')
-    .description('Remove managed hooks and stop the legacy daemon')
+    .description('Remove managed hooks and stop the background monitor')
     .action(() => void uninstallCommand());
 
 program
@@ -35,7 +35,7 @@ program
 
 program
     .command('daemon')
-    .description('Run the daemon (called by launchd — not for direct use)')
+    .description('Run the background monitor (called by launchd — not for direct use)')
     .option('--scan-interval <ms>', 'Scan interval in milliseconds', '2000')
     .addHelpText('after', '\nThis command is managed by launchd. Use `install` instead.')
     .action((options: { scanInterval?: string }) => void daemonCommand(options));
@@ -44,9 +44,9 @@ program
     .command('logs')
     .description('Show recent hook log entries')
     .option('-n <lines>', 'Number of lines to show', '50')
-    .option('--daemon', 'Show legacy daemon log instead of hooks log')
+    .option('--daemon', 'Show background monitor log instead of hooks log')
     .option('--wrappers', 'Show hooks wrapper/shim log')
-    .option('--error', 'Show legacy daemon error log')
+    .option('--error', 'Show background monitor error log')
     .action((options: { n?: string; daemon?: boolean; wrappers?: boolean; error?: boolean }) => logsCommand(options));
 
 program

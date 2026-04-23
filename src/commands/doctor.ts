@@ -68,7 +68,7 @@ export async function buildDoctorReport(): Promise<DoctorReport> {
     const ledger = new EventLedger(config, silentLogger);
     const manifest = await hookInstaller.loadManifest();
     const status = await hookInstaller.getStatus();
-    const legacyDaemonRunning = await launchAgent.isRunning();
+    const backgroundMonitorRunning = await launchAgent.isRunning();
 
     const sections: DoctorSection[] = [];
     let hasCriticalFailures = false;
@@ -77,7 +77,7 @@ export async function buildDoctorReport(): Promise<DoctorReport> {
     hasCriticalFailures ||= artifacts.lines.some(line => line.level === 'error');
     sections.push(artifacts);
 
-    const runtime = await buildRuntimeSection(executor, manifest);
+    const runtime = await buildRuntimeSection(executor, manifest, backgroundMonitorRunning);
     hasCriticalFailures ||= runtime.lines.some(line => line.level === 'error');
     sections.push(runtime);
 
@@ -85,7 +85,7 @@ export async function buildDoctorReport(): Promise<DoctorReport> {
     hasCriticalFailures ||= provider.lines.some(line => line.level === 'error');
     sections.push(provider);
 
-    sections.push(buildSemanticRiskSection(status, legacyDaemonRunning));
+    sections.push(buildSemanticRiskSection(status, backgroundMonitorRunning));
     sections.push(await buildLedgerSection(ledger));
     sections.push(await buildRecentHooksSection());
     sections.push({
@@ -137,6 +137,7 @@ async function buildArtifactsSection(manifestPresent: boolean): Promise<DoctorSe
 async function buildRuntimeSection(
     executor: CommandExecutor,
     manifest: Awaited<ReturnType<HookInstaller['loadManifest']>>,
+    backgroundMonitorRunning: boolean,
 ): Promise<DoctorSection> {
     const lines: DoctorLine[] = [];
     const shimResult = await executor.exec(getShimPath(), ['--version']);
@@ -166,6 +167,12 @@ async function buildRuntimeSection(
 
     lines.push(await checkExecutable(getFocusScriptPath(), 'Focus script exists and is executable'));
     lines.push(await checkExists(getCodexHooksPath(), false, 'Codex hooks.json exists'));
+    lines.push({
+        level: backgroundMonitorRunning ? 'ok' : 'error',
+        text: backgroundMonitorRunning
+            ? 'Background monitor is running.'
+            : 'Background monitor is not running.',
+    });
 
     return {
         title: 'Section 2 — runtime target health',
@@ -213,7 +220,7 @@ async function buildProviderSection(status: Awaited<ReturnType<HookInstaller['ge
 
 function buildSemanticRiskSection(
     status: Awaited<ReturnType<HookInstaller['getStatus']>>,
-    legacyDaemonRunning: boolean,
+    backgroundMonitorRunning: boolean,
 ): DoctorSection {
     const lines: DoctorLine[] = [];
 
@@ -253,10 +260,10 @@ function buildSemanticRiskSection(
             text: 'Managed wrapper version header is missing or stale.',
         });
     }
-    if (legacyDaemonRunning) {
+    if (!backgroundMonitorRunning) {
         lines.push({
             level: 'warn',
-            text: 'Legacy daemon is still running and should remain out of the critical path.',
+            text: 'Background monitor is stopped, so Codex approval fallback notifications will be missed.',
         });
     }
     if (lines.length === 0) {

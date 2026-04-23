@@ -46,6 +46,7 @@ import {
 
 const BASH_PATH = '/bin/bash';
 const WRAPPER_VERSION = 3;
+const CODEX_PERMISSION_REQUEST_MATCHER = 'Bash';
 
 export interface HookInstallResult {
     readonly manifest: InstallManifest;
@@ -90,11 +91,19 @@ export class HookInstaller {
         const parsedCodexHooks = parseCodexHooksSettings(rawCodexHooks);
         const codexStopCommand = this.getCodexStopHookCommand();
         const codexPermissionCommand = this.getCodexPermissionHookCommand();
-        const nextCodexHooks = upsertCodexCommandHook(
-            upsertCodexCommandHook(parsedCodexHooks, 'Stop', codexStopCommand),
+        const codexHooksWithoutLegacyPermissionHook = removeCodexCommandHook(
+            parsedCodexHooks,
             'PermissionRequest',
             codexPermissionCommand,
-            { statusMessage: 'Checking approval request' },
+        );
+        const nextCodexHooks = upsertCodexCommandHook(
+            upsertCodexCommandHook(codexHooksWithoutLegacyPermissionHook, 'Stop', codexStopCommand),
+            'PermissionRequest',
+            codexPermissionCommand,
+            {
+                matcher: CODEX_PERMISSION_REQUEST_MATCHER,
+                statusMessage: 'Checking approval request',
+            },
         );
 
         const rawClaudeSettings = await readFileIfExists(getClaudeSettingsPath()) ?? '{}';
@@ -265,6 +274,7 @@ export class HookInstaller {
                     parsedHooks,
                     'PermissionRequest',
                     manifest?.codexPermissionCommand ?? this.getCodexPermissionHookCommand(),
+                    CODEX_PERMISSION_REQUEST_MATCHER,
                 );
             } catch {
                 codexStopConfigured = false;

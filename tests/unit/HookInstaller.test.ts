@@ -92,6 +92,9 @@ describe('HookInstaller', () => {
         expect(codexConfig).toContain('[features]');
         expect(codexConfig).toContain('codex_hooks = true');
         expect(codexHooks.hooks?.Stop?.[0]?.hooks?.[0]).toMatchObject({ type: 'command' });
+        expect(codexHooks.hooks?.PermissionRequest?.[0]).toMatchObject({
+            matcher: 'Bash',
+        });
         expect(codexHooks.hooks?.PermissionRequest?.[0]?.hooks?.[0]).toMatchObject({
             type: 'command',
             statusMessage: 'Checking approval request',
